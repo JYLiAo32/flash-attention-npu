@@ -7,8 +7,8 @@ import torch
 import torch.nn as nn
 
 # isort: off
-# We need to import the CUDA kernels after importing torch
-import flash_attn_3_C # Registers operators with PyTorch
+# We need to import the kernels after importing torch
+import flash_attn_npu_3 # Registers operators with PyTorch
 
 # isort: on
 
@@ -108,7 +108,7 @@ def _flash_attn_forward(
     ]
     rotary_cos, rotary_sin = [maybe_contiguous(x) for x in (rotary_cos, rotary_sin)]
     seqlens_rotary = maybe_contiguous(seqlens_rotary)
-    out, softmax_lse, out_accum, softmax_lse_accum = flash_attn_3_C.fwd(
+    out, softmax_lse, out_accum, softmax_lse_accum = flash_attn_npu_3.fwd(
         q,
         k,
         v,
@@ -286,7 +286,7 @@ def _flash_attn_backward(
 ) -> torch.Tensor:
     # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
-    softmax_d, *rest = flash_attn_3_C.bwd(
+    softmax_d, *rest = flash_attn_npu_3.bwd(
         dout,
         q,
         k,
@@ -936,7 +936,7 @@ def flash_attn_varlen_func(
 
 
 def flash_attn_combine(out_partial, lse_partial, out=None, out_dtype=None):
-    return flash_attn_3_C.fwd_combine(out_partial, lse_partial, out, out_dtype)
+    return flash_attn_npu_3.fwd_combine(out_partial, lse_partial, out, out_dtype)
 
 
 def flash_attn_with_kvcache(
@@ -1124,7 +1124,7 @@ def get_scheduler_metadata(
     cache_seqlens = maybe_contiguous(cache_seqlens)
     if headdim_v is None:
         headdim_v = headdim
-    scheduler_metadata = flash_attn_3_C.get_scheduler_metadata(
+    scheduler_metadata = flash_attn_npu_3.get_scheduler_metadata(
         batch_size, max_seqlen_q, max_seqlen_k, num_heads_q, num_heads_kv, headdim, headdim_v,
         qkv_dtype,
         cache_seqlens,
