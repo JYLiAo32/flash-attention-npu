@@ -11,12 +11,14 @@ def group_matmul(head, kv_head, left, right, high_prec = 1):
     group_num = head // kv_head
     score = None
     for i in range(kv_head):
+        left_slice = left[i * group_num:(i + 1) * group_num, :, :].to(torch.float32)
+        right_slice = right[i:(i + 1), :, :].to(torch.float32)
+        if right_slice.shape[0] == 1 and left_slice.shape[0] > 1:
+             right_slice = right_slice.expand(left_slice.shape[0], -1, -1).contiguous()
         if high_prec == 0:
-            group_score = torch.matmul(left[i * group_num:(i + 1) * group_num, :, :].to(torch.float32),
-                                        right[i:(i + 1), :, :].to(torch.float32)).to(torch.float32)
+            group_score = torch.matmul(left_slice, right_slice).to(torch.float32)
         else:
-            group_score = torch.matmul(left[i * group_num:(i + 1) * group_num, :, :].to(torch.float32),
-                                        right[i:(i + 1), :, :].to(torch.float32))
+            group_score = torch.matmul(left_slice, right_slice)
         if score is None:
             score = group_score
         else:
