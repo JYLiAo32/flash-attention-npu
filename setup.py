@@ -22,8 +22,8 @@ import urllib.request
 import urllib.error
 from wheel.bdist_wheel import bdist_wheel as _bdist_wheel
 
-import torch_npu
 import torch
+import torch_npu
 
 with open("README.md", "r", encoding="utf-8") as fh:
     long_description = fh.read()
@@ -32,11 +32,16 @@ with open("README.md", "r", encoding="utf-8") as fh:
 # ninja build does not work unless include_dirs are abs path
 this_dir = os.path.dirname(os.path.abspath(__file__))
 
-PACKAGE_NAME = "flash_attn"
+PACKAGE_NAME = "flash_attn_npu"
+
+BASE_WHEEL_URL = (
+    "https://github.com/MinghuasLab/flash-attention-npu/releases/download/{tag_name}/{wheel_name}"
+)
 
 # FORCE_BUILD: Force a fresh build locally, instead of attempting to find prebuilt wheels
-# SKIP_CUDA_BUILD: Intended to allow CI to use a simple `python setup.py sdist` run to copy over raw files, without any cuda compilation
+# SKIP_NPU_BUILD: Intended to allow CI to use a simple `python setup.py sdist` run to copy over raw files, without any NPU compilation
 FORCE_BUILD = os.getenv("FLASH_ATTENTION_FORCE_BUILD", "FALSE") == "TRUE"
+SKIP_NPU_BUILD = os.getenv("FLASH_ATTENTION_SKIP_NPU_BUILD", "FALSE") == "TRUE"
 BUILD_VERSION = os.getenv("FLASH_ATTN_BUILD_VERSION", "all").lower()
 
 def get_platform():
@@ -135,9 +140,9 @@ class BishengBuildExt(build_ext):
                 text=True,
                 check=True
             )
-            print("编译成功！输出：", result.stdout)
+            print(f"Compilation successful! output: {result.stdout}")
         except subprocess.CalledProcessError as e:
-            print(f"编译失败！错误输出：{e.stderr}")
+            print(f"Compilation failed! Error output: {e.stderr}")
             raise e
 
 cmdclass = {}
@@ -154,23 +159,24 @@ BASE_DIR = os.path.dirname(os.path.realpath(__file__))
 source_files = glob.glob(os.path.join(BASE_DIR, "csrc/flash_attn_npu", "flash_api.cpp"), recursive=True)
 source_files_v3 = glob.glob(os.path.join(BASE_DIR, "csrc/flash_attn_npu_v3", "flash_api.cpp"), recursive=True)
 
-if BUILD_VERSION in ("v2", "all"):
-    ext_modules.append(Extension(
-        name="flash_attn_2_C",
-        sources=source_files,
-        language="c++",
-    ))
+if not SKIP_NPU_BUILD:
+    if BUILD_VERSION in ("v2", "all"):
+        ext_modules.append(Extension(
+            name="flash_attn_npu_2",
+            sources=source_files,
+            language="c++",
+        ))
 
-if BUILD_VERSION in ("v3", "all"):
-    ext_modules.append(Extension(
-        name="flash_attn_3_C",
-        sources=source_files_v3,
-        language="c++",
-    ))
+    if BUILD_VERSION in ("v3", "all"):
+        ext_modules.append(Extension(
+            name="flash_attn_npu_3",
+            sources=source_files_v3,
+            language="c++",
+        ))
 
 
 def get_package_version():
-    with open(Path(this_dir) / "flash_attn" / "__init__.py", "r") as f:
+    with open(Path(this_dir) / "flash_attn_npu" / "__init__.py", "r") as f:
         version_match = re.search(r"^__version__\s*=\s*(.*)$", f.read(), re.MULTILINE)
     public_version = ast.literal_eval(version_match.group(1))
     local_version = os.environ.get("FLASH_ATTN_LOCAL_VERSION")
@@ -243,12 +249,15 @@ setup(
             "dist",
             "docs",
             "benchmarks",
-            "flash_attn.egg-info",
+            "flash_attn_npu.egg-info",
         )
     ),
-    description="Flash Attention: Fast and Memory-Efficient Exact Attention",
+    author="Minghua Shen",
+    author_email="shenmh6@mail.sysu.edu.cn",
+    description="High-performance FlashAttention implementation for Ascend NPU",
     long_description=long_description,
     long_description_content_type="text/markdown",
+    url="https://github.com/MinghuasLab/flash-attention-npu",
     classifiers=[
         "Programming Language :: Python :: 3",
         "License :: OSI Approved :: BSD License",
@@ -263,6 +272,7 @@ setup(
     python_requires=">=3.9",
     install_requires=[
         "torch",
+        "torch_npu",
         "einops",
     ],
     setup_requires=[

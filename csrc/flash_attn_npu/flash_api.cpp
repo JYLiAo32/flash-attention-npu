@@ -958,7 +958,7 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x multipl
     return {dq, dk, dv, softmax_d};
 }
 
-PYBIND11_MODULE(flash_attn_2_C, m)
+PYBIND11_MODULE(flash_attn_npu_2, m)
 {
     m.doc() = "FlashAttention";
     m.def("fwd", &mha_fwd, "Forward pass");

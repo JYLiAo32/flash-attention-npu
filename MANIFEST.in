@@ -1,0 +1,7 @@
+recursive-include csrc/catlass *.h *.hpp *.cpp
+prune csrc/catlass/tests
+prune csrc/catlass/examples
+prune csrc/catlass/benchmarks
+
+recursive-include csrc/flash_attn_npu *.h *.hpp *.cpp
+recursive-include csrc/flash_attn_npu_v3 *.h *.hpp *.cpp

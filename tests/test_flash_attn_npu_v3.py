@@ -5,7 +5,7 @@ import os
 import torch
 import torch_npu
 import pytest
-from flash_attn_v3 import flash_attn_with_kvcache
+from flash_attn_npu_v3 import flash_attn_with_kvcache
 
 def group_matmul(head, kv_head, left, right, high_prec = 1):
     group_num = head // kv_head
