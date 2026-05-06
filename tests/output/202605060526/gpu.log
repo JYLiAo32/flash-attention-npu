@@ -1,0 +1,117 @@
+============================= test session starts ==============================
+platform linux -- Python 3.10.19, pytest-9.0.2, pluggy-1.6.0
+rootdir: /home/ljy/workspace/fa/flash-attention_dao/tests
+configfile: pyproject.toml
+collected 8 items
+
+test_flash_attn_t1.py Output max diff: 0.000244140625
+Output mean diff: 1.049041748046875e-05
+Pytorch max diff: 0.000732421875
+Pytorch mean diff: 2.6941299438476562e-05
+dQ max diff: 0.00048828125
+dK max diff: 0.00048828125
+dV max diff: 0.00048828125
+dQKV mean diff: 1.1682510375976562e-05
+dQ Pytorch max diff: 0.00146484375
+dK Pytorch max diff: 0.001220703125
+dV Pytorch max diff: 0.000732421875
+dQKV Pytorch mean diff: 3.0279159545898438e-05
+.Output max diff: 0.00048828125
+Output mean diff: 1.817941665649414e-05
+Pytorch max diff: 0.0009765625
+Pytorch mean diff: 4.464387893676758e-05
+dQ max diff: 0.00048828125
+dK max diff: 0.00048828125
+dV max diff: 0.0009765625
+dQKV mean diff: 2.09808349609375e-05
+dQ Pytorch max diff: 0.0009765625
+dK Pytorch max diff: 0.0009765625
+dV Pytorch max diff: 0.0009765625
+dQKV Pytorch mean diff: 4.887580871582031e-05
+.Output max diff: 0.015625
+Output mean diff: 0.00010919570922851562
+Pytorch max diff: 0.015625
+Pytorch mean diff: 0.0002651214599609375
+dQ max diff: 0.015625
+dK max diff: 0.015625
+dV max diff: 0.015625
+dQ mean diff: 0.00014019012451171875
+dK mean diff: 0.0002288818359375
+dV mean diff: 0.00024127960205078125
+dQ Pytorch max diff: 0.015625
+dK Pytorch max diff: 0.015625
+dV Pytorch max diff: 0.015625
+dQ Pytorch mean diff: 0.000293731689453125
+dK Pytorch mean diff: 0.0005035400390625
+dV Pytorch mean diff: 0.000438690185546875
+.Output max diff: 0.001953125
+Output mean diff: 2.5331974029541016e-05
+Pytorch max diff: 0.001953125
+Pytorch mean diff: 6.03795051574707e-05
+dQ max diff: 0.001953125
+dK max diff: 0.00390625
+dV max diff: 0.0078125
+dQ mean diff: 3.24249267578125e-05
+dK mean diff: 9.268522262573242e-05
+dV mean diff: 0.00010514259338378906
+dQ Pytorch max diff: 0.001953125
+dK Pytorch max diff: 0.00390625
+dV Pytorch max diff: 0.0078125
+dQ Pytorch mean diff: 6.80088996887207e-05
+dK Pytorch mean diff: 0.0001678466796875
+dV Pytorch mean diff: 0.0001538991928100586
+.Output max diff: 0.00390625
+Output mean diff: 0.00012969970703125
+Pytorch max diff: 0.01171875
+Pytorch mean diff: 0.000331878662109375
+dQ max diff: 0.00390625
+dK max diff: 0.0078125
+dV max diff: 0.00390625
+dQ mean diff: 0.000152587890625
+dK mean diff: 9.632110595703125e-05
+dV mean diff: 9.965896606445312e-05
+dQ Pytorch max diff: 0.01171875
+dK Pytorch max diff: 0.01171875
+dV Pytorch max diff: 0.0078125
+dQ Pytorch mean diff: 0.0003871917724609375
+dK Pytorch mean diff: 0.000247955322265625
+dV Pytorch mean diff: 0.000209808349609375
+.Output max diff: 0.00390625
+Output mean diff: 0.000118255615234375
+Pytorch max diff: 0.01171875
+Pytorch mean diff: 0.00030517578125
+dQ max diff: 0.0078125
+dK max diff: 0.0078125
+dV max diff: 0.00390625
+dQ mean diff: 0.0001392364501953125
+dK mean diff: 9.012222290039062e-05
+dV mean diff: 9.298324584960938e-05
+dQ Pytorch max diff: 0.0234375
+dK Pytorch max diff: 0.0234375
+dV Pytorch max diff: 0.01171875
+dQ Pytorch mean diff: 0.000354766845703125
+dK Pytorch mean diff: 0.000232696533203125
+dV Pytorch mean diff: 0.00019550323486328125
+.Output max diff: 0.001953125
+Output mean diff: 1.3649463653564453e-05
+Pytorch max diff: 0.001953125
+Pytorch mean diff: 3.361701965332031e-05
+dQ max diff: 0.001953125
+dK max diff: 0.001953125
+dV max diff: 0.00390625
+dQ mean diff: 1.8477439880371094e-05
+dK mean diff: 2.9802322387695312e-05
+dV mean diff: 3.0338764190673828e-05
+dQ Pytorch max diff: 0.00390625
+dK Pytorch max diff: 0.001953125
+dV Pytorch max diff: 0.001953125
+dQ Pytorch mean diff: 3.731250762939453e-05
+dK Pytorch mean diff: 6.4849853515625e-05
+dV Pytorch mean diff: 5.5849552154541016e-05
+.Output max diff: 0.0009765625
+Output mean diff: 3.409385681152344e-05
+Pytorch max diff: 0.001953125
+Pytorch mean diff: 8.910894393920898e-05
+.
+
+============================== 8 passed in 4.94s ===============================
