@@ -1,3 +1,4 @@
+# Adapted from https://github.com/Dao-AILab/flash-attention/blob/main/tests/test_flash_attn.py
 import math
 
 import pytest
