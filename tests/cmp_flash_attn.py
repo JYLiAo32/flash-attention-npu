@@ -5,16 +5,14 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange, repeat
 
-# 设置测试环境
-TEST_DEVICE = "cuda"  # "npu" or "cuda"
+from flash_attn import flash_attn_with_kvcache
 
-if TEST_DEVICE == "cuda":
-    from flash_attn import flash_attn_with_kvcache
-elif TEST_DEVICE == "npu":
-    import torch_npu
-    from flash_attn_npu import flash_attn_with_kvcache
+if torch.cuda.is_available():
+    TEST_DEVICE = "cuda"
+elif hasattr(torch, "npu") and torch.npu.is_available():
+    TEST_DEVICE = "npu"
 else:
-    raise ValueError(f"Unsupport device: {TEST_DEVICE}")
+    raise RuntimeError("No supported device found (CUDA/NPU)")
 
 def attn_bias_from_alibi_slopes(
     slopes,
