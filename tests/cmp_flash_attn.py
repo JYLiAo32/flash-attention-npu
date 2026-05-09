@@ -10,8 +10,11 @@ from flash_attn import flash_attn_with_kvcache
 
 if torch.cuda.is_available():
     TEST_DEVICE = "cuda"
+    # from flash_attn import flash_attn_with_kvcache
 elif hasattr(torch, "npu") and torch.npu.is_available():
     TEST_DEVICE = "npu"
+    # import torch_npu
+    # from flash_attn_npu import flash_attn_with_kvcache
 else:
     raise RuntimeError("No supported device found (CUDA/NPU)")
 
