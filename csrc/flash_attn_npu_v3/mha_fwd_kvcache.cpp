@@ -115,7 +115,7 @@ namespace SplitFuse {
             gS.SetGlobalBuffer((__gm__ ElementS *)(params.workSpace));
             AscendC::GlobalTensor<ElementP> gP;
             gP.SetGlobalBuffer((__gm__ ElementP *)(params.workSpace + mm1OutSize));
-            AscendC::GlobalTensor<ElementOTmp> gOTmp;
+            AscendC::GlobalTensor<ElementOTmp> gOTmp;  // FIXME: 不参与计算？只是输出用于调试？
             gOTmp.SetGlobalBuffer((__gm__ ElementOTmp *)(params.workSpace + mm1OutSize + smOnlineOutSize));
             AscendC::GlobalTensor<ElementOTmp> gOUpdate;
             gOUpdate.SetGlobalBuffer((__gm__ ElementOTmp *)(params.workSpace +
