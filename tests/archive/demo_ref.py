@@ -27,7 +27,7 @@ class LlamaAttentionLayer(nn.Module):
         self.o_proj = nn.Linear(self.num_attention_heads * self.head_dim, self.hidden_size, bias=config.attention_bias)
 
         # 3.初始化 KV Cache
-        max_cache_len = config.seqlen_k + config.seqlen_q + 16
+        max_cache_len = config.seqlen_k + config.seqlen_q
         self.k_cache = torch.zeros(config.batch_size, max_cache_len, config.num_key_value_heads, config.head_dim,
                                     device=TEST_DEVICE, dtype=torch.float16)
         self.v_cache = torch.zeros_like(self.k_cache)
@@ -142,9 +142,6 @@ def test_ref_implementation(seqlen_q, seqlen_k, d, causal, mha_type, dtype, soft
 
     out_ref = model(hidden_states, position_embeddings)
 
-    print(init_k_cache.shape, init_v_cache.shape, out_ref.shape)
-    print(f"cache_seqlens: {config.seqlen_k}")
-    
     torch.save({
         "hidden_states": hidden_states.cpu(),
         "q_proj_weight": model.q_proj.weight.cpu(),
