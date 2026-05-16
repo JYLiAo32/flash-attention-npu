@@ -2,14 +2,14 @@ import torch
 import torch.nn as nn
 from types import SimpleNamespace
 
-# from flash_attn import flash_attn_with_kvcache
-# TEST_DEVICE = "cuda"
-# PACKAGE_NAME = "flash-attn"
+from flash_attn import flash_attn_with_kvcache
+TEST_DEVICE = "cuda"
+PACKAGE_NAME = "flash-attn"
 
-import torch_npu
-from flash_attn_npu import flash_attn_with_kvcache
-TEST_DEVICE = "npu"
-PACKAGE_NAME = "flash-attn-npu"
+# import torch_npu
+# from flash_attn_npu import flash_attn_with_kvcache
+# TEST_DEVICE = "npu"
+# PACKAGE_NAME = "flash-attn-npu"
 
 class LlamaAttentionLayer(nn.Module):
     """
@@ -28,17 +28,21 @@ class LlamaAttentionLayer(nn.Module):
         self.causal = config.causal
         self.window_size = config.window_size
         self.num_splits = config.num_splits
-        self.softcap = config.softcap
+        self.softcap = config.softcap if hasattr(config, 'softcap') else 0
         self.k_cache = None
         self.v_cache = None
         
-        # 步骤2：实例化 Matmul 算子
-        self.q_proj = nn.Linear(self.hidden_size, self.num_attention_heads * self.head_dim, bias=config.attention_bias)
-        self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
-        self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
-        self.o_proj = nn.Linear(self.num_attention_heads * self.head_dim, self.hidden_size, bias=config.attention_bias)
+        # 步骤2：实例化计算所需 Matmul 算子
+        self.q_proj = nn.Linear(self.hidden_size, self.num_attention_heads * self.head_dim, 
+                                bias=config.attention_bias)
+        self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, 
+                                bias=config.attention_bias)
+        self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, 
+                                bias=config.attention_bias)
+        self.o_proj = nn.Linear(self.num_attention_heads * self.head_dim, self.hidden_size, 
+                                bias=config.attention_bias)
         
-        # 步骤3：指定 FA 算子
+        # 步骤3：指定计算所需 FA 算子
         self.attn_layer = flash_attn_with_kvcache
     
     def forward(self, hidden_states, position_embeddings):
@@ -56,10 +60,14 @@ class LlamaAttentionLayer(nn.Module):
         self.k_cache[:, self.cache_seqlens:self.cache_seqlens + Sq] = k
         self.v_cache[:, self.cache_seqlens:self.cache_seqlens + Sq] = v
         self.cache_seqlens += Sq
-        cache_seqlens = torch.full((B,), self.cache_seqlens, dtype=torch.int32, device=hidden_states.device)
+        cache_seqlens = torch.full((B,), self.cache_seqlens, dtype=torch.int32, 
+                                   device=hidden_states.device)
         
         # 步骤4：调用 FA 算子计算注意力结果
-        out = self.attn_layer(q, self.k_cache, self.v_cache, None, None, cache_seqlens=cache_seqlens, causal=self.causal, window_size=self.window_size, softcap=self.softcap, num_splits=self.num_splits)
+        out = self.attn_layer(q, self.k_cache, self.v_cache, None, None, 
+                              cache_seqlens=cache_seqlens, causal=self.causal, 
+                              window_size=self.window_size, softcap=self.softcap, 
+                              num_splits=self.num_splits)
                 
         # 步骤5：通过 Matmul 算子计算出最终结果
         out = out.reshape(B, Sq, self.num_attention_heads * self.head_dim)
@@ -108,8 +116,8 @@ class LlamaAttentionLayer(nn.Module):
             torch.cuda.synchronize()
 
 # 加载预先生成的输入数据和参考输出, 初始化网络并加载权重。
-def load_data_and_model(device, dtype, model):
-    data = torch.load("ref_data.pt", map_location=device)
+def load_data_and_model(file_path, device, dtype, model):
+    data = torch.load(file_path, map_location=device)
     hidden_states, out_ref = data["hidden_states"], data["out_ref"]
     init_k_cache, init_v_cache = data["init_k_cache"], data["init_v_cache"]
     cache_seqlens = data["cache_seqlens"]
@@ -153,17 +161,17 @@ def compare_metrics(out_ref, out_flash, model):
 
 if __name__ == "__main__":
     # 步骤1：配置参数
-    d, nheads, num_splits, softcap_val = 128, 6, 1, 0.0
-    device, causal, dtype = TEST_DEVICE, True, torch.float16
-    config = SimpleNamespace(hidden_size=nheads * d, num_attention_heads=nheads,
-            num_key_value_heads=nheads, head_dim=d, attention_bias=True, causal=causal, 
-            window_size=(-1, -1), num_splits=num_splits, softcap=softcap_val)
+    file_path = "ref_data.pt"
+    config = SimpleNamespace(hidden_size=768, num_attention_heads=6,
+            num_key_value_heads=6, head_dim=128, attention_bias=True, causal=True, 
+            softcap=0, window_size=(-1, -1), num_splits=1)
     
     # 步骤2：构建网络层实例
-    model = LlamaAttentionLayer(config).to(device).to(dtype)
+    model = LlamaAttentionLayer(config).to(TEST_DEVICE).to(torch.float16)
     
-    # 步骤3：加载数据和模型权重
-    llama_attention_layer, input_data, out_ref, pos_emb = load_data_and_model(TEST_DEVICE, dtype, model)
+    # 步骤3：加载输入数据、模型权重和在CPU上计算得到的参考真值结果
+    llama_attention_layer, input_data, out_ref, pos_emb = load_data_and_model(file_path, TEST_DEVICE, 
+                                                                              torch.float16, model)
     
     # 步骤4：开始计算，并记录计算时间
     llama_attention_layer.start_time_recording()
