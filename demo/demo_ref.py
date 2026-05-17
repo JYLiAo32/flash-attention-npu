@@ -81,11 +81,21 @@ class LlamaAttentionLayer(nn.Module):
     # 注意力算子的纯 PyTorch 实现, 用于生成参考输出
     def _eager_attn(self, q, k, v, Sk):
         qf, kf, vf = q.float(), k.float(), v.float()
-        scores = torch.matmul(qf, kf.transpose(-1, -2)) * self.scaling
+        scores = torch.matmul(qf, kf.transpose(-1, -2))
 
         # 应用softcap
+        print(self.softcap)
         if self.softcap > 0.0:
-            scores = self.softcap * torch.tanh(scores / self.softcap)
+            # scores = self.softcap * torch.tanh(scores / self.softcap)
+            scores = scores * (self.scaling / self.softcap)
+            scores = scores * (-2.0)
+            scores = torch.exp(scores)
+            scores = scores + 1.0
+            scores = torch.reciprocal(scores)
+            scores = scores * (2.0 * self.softcap)
+            scores = scores - self.softcap
+        else:
+            scores = scores * self.scaling
 
         if self.causal:
             B, H, Sq, Sk_total = scores.shape
@@ -109,7 +119,8 @@ class LlamaAttentionLayer(nn.Module):
         return torch.cat((-x2, x1), dim=-1)
 
 
-def test_ref_implementation(seqlen_q, seqlen_k, d, causal, mha_type, dtype, softcap_val):
+def test_ref_implementation(seqlen_q, seqlen_k, d, causal, mha_type, dtype, softcap_val=0.0,
+                            save_path="ref_data.pt"):
     device = TEST_DEVICE
     torch.manual_seed(0)
 
@@ -158,7 +169,7 @@ def test_ref_implementation(seqlen_q, seqlen_k, d, causal, mha_type, dtype, soft
         "out_ref": out_ref.cpu(),
         "cos": cos.cpu(),
         "sin": sin.cpu()
-    }, "ref_data.pt")
+    }, save_path)
 
     metrics = {
         "min": out_ref.min().item(),
@@ -172,16 +183,24 @@ def test_ref_implementation(seqlen_q, seqlen_k, d, causal, mha_type, dtype, soft
         json.dump(metrics, f, indent=2)
 
     print(f"\n[Ref] shape:{out_ref.shape} range:[{out_ref.min():.6e}, {out_ref.max():.6e}]")
-    print("Saved: ref_data.pt, metrics_ref.json")
+    print(f"Saved: {save_path}, metrics_ref.json")
 
 
 if __name__ == "__main__":
     test_ref_implementation(
-        seqlen_q=16,
-        seqlen_k=4096,
+        # seqlen_q=16,
+        # seqlen_k=4096,
+        # d=128,
+        seqlen_q=512,
+        seqlen_k=1024,
         d=128,
         causal=True,
         mha_type="mha",
         dtype=torch.float16,
-        softcap_val=0.0
+        # save_path="ref_data_softcap50.pt",
+        # softcap_val=50.0,
+        # save_path="ref_data_softcap10.pt",
+        # softcap_val=10.0,
+        save_path="ref_data_softcap30.pt",
+        softcap_val=30.0,
     )
