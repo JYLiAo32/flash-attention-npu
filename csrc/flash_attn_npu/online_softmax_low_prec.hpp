@@ -64,7 +64,7 @@ public:
     static constexpr uint32_t SPLIT_COL_IDX_2 = 2;
     static constexpr uint32_t SPLIT_COL_IDX_3 = 3;
     __aicore__ inline
-    BlockEpilogue(Arch::Resource<ArchTag> &resource, float scaleValue_)
+    BlockEpilogue(Arch::Resource<ArchTag> &resource, float scaleValue_, float /*softcapValue_*/ = 0.0f)
     {
         // Allocate UB space
         constexpr uint32_t LS_UB_TENSOR_OFFSET = 0;

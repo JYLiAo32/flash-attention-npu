@@ -60,7 +60,7 @@ public:
     static constexpr int64_t UB_FLOAT_LINE_SIZE = 64;
 
     __aicore__ inline
-    BlockEpilogue(Arch::Resource<ArchTag> &resource, float scaleValue_)
+    BlockEpilogue(Arch::Resource<ArchTag> &resource, float scaleValue_, float softcapValue_ = 0.0f)
     {
         // Allocate UB space
         constexpr uint32_t LS_UB_TENSOR_OFFSET = 0;
@@ -80,6 +80,7 @@ public:
         constexpr uint32_t MASK16_UB_TENSOR_OFFSET = 11 * UB_UINT8_BLOCK_SIZE;
 
         scaleValue = scaleValue_;
+        softcapValue = softcapValue_;
         lsUbTensor = resource.ubBuf.template GetBufferByByte<float>(LS_UB_TENSOR_OFFSET);
         lpUbTensor = resource.ubBuf.template GetBufferByByte<ElementOutput>(LP_UB_TENSOR_OFFSET);
         maskUbTensor = resource.ubBuf.template GetBufferByByte<ElementMask>(MASK_UB_TENSOR_OFFSET);
@@ -463,6 +464,47 @@ public:
             AscendC::UnaryRepeatParams(1, 1, 8, 8));
 
         AscendC::PipeBarrier<PIPE_V>();
+    }
+
+    // softcap * tanh(x) = (2 * softcap) / (1 + exp(-2x)) - softcap
+    template <bool hasSoftcap>
+    __aicore__ inline
+    void ApplySoftcap(uint32_t sUbOffset, uint32_t rowNumCurLoop, uint32_t columnNumRound)
+    {
+        if constexpr (hasSoftcap) {
+            uint32_t repeatTimes = CeilDiv(rowNumCurLoop * columnNumRound, FLOAT_VECTOR_SIZE);
+            AscendC::UnaryRepeatParams unaryParams(1, 1, 8, 8);
+
+            AscendC::Muls<float, false>(
+                lsUbTensor[sUbOffset], lsUbTensor[sUbOffset],
+                -2.0f, (uint64_t)0, repeatTimes, unaryParams);
+            AscendC::PipeBarrier<PIPE_V>();
+
+            AscendC::Exp<float, false>(
+                lsUbTensor[sUbOffset], lsUbTensor[sUbOffset],
+                (uint64_t)0, repeatTimes, unaryParams);
+            AscendC::PipeBarrier<PIPE_V>();
+
+            AscendC::Adds<float, false>(
+                lsUbTensor[sUbOffset], lsUbTensor[sUbOffset],
+                1.0f, (uint64_t)0, repeatTimes, unaryParams);
+            AscendC::PipeBarrier<PIPE_V>();
+
+            AscendC::Reciprocal<float, false>(
+                lsUbTensor[sUbOffset], lsUbTensor[sUbOffset],
+                (uint64_t)0, repeatTimes, unaryParams);
+            AscendC::PipeBarrier<PIPE_V>();
+
+            AscendC::Muls<float, false>(
+                lsUbTensor[sUbOffset], lsUbTensor[sUbOffset],
+                2.0f * softcapValue, (uint64_t)0, repeatTimes, unaryParams);
+            AscendC::PipeBarrier<PIPE_V>();
+
+            AscendC::Adds<float, false>(
+                lsUbTensor[sUbOffset], lsUbTensor[sUbOffset],
+                -softcapValue, (uint64_t)0, repeatTimes, unaryParams);
+            AscendC::PipeBarrier<PIPE_V>();
+        }
     }
 
     template<typename ElementMaskDst, typename ElementMaskSrc>
@@ -869,6 +911,9 @@ public:
                 auto layoutOutputCurLoop = layoutOutput.GetTileLayout(MatrixCoord(rowNumCurLoop, columnNum));
                 AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(pingpongFlag);
                 ScaleS((pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound);
+                if (softcapValue > 0.0f) {
+                    ApplySoftcap<true>((pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound);
+                }
                 SubCoreCompute<false>(
                     gOutputCurLoop,
                     layoutOutputCurLoop,
@@ -994,6 +1039,9 @@ public:
                 
                 AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(pingpongFlag);
                 ScaleS((pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound);
+                if (softcapValue > 0.0f) {
+                    ApplySoftcap<true>((pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound);
+                }
                 ApplyMask(
                     (pingpongFlag * MAX_UB_S_ELEM_NUM),
                     rowNumCurLoop, columnNumRound,
@@ -1042,6 +1090,7 @@ public:
 
 private:
     float scaleValue;
+    float softcapValue;
     AscendC::LocalTensor<float> lsUbTensor;
     AscendC::LocalTensor<ElementOutput> lpUbTensor;
     AscendC::LocalTensor<ElementMask> maskUbTensor;

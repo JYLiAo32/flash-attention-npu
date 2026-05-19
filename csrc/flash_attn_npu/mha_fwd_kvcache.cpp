@@ -95,6 +95,7 @@ namespace SplitFuse {
             uint32_t blockSize = fATilingData->blockSize;
             uint32_t maskType = fATilingData->maskType;
             float scaleValue = fATilingData->scaleValue;
+            float softcapValue = fATilingData->softcapValue;
             AscendC::GlobalTensor<ElementQ> gQ;
             gQ.SetGlobalBuffer((__gm__ ElementQ *)params.q);
             AscendC::GlobalTensor<ElementK> gK;
@@ -179,7 +180,7 @@ namespace SplitFuse {
             AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID2);
             AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID3);
 
-            EpilogueOnlineSoftmax epilogueOnlineSoftmax(resource, scaleValue);
+            EpilogueOnlineSoftmax epilogueOnlineSoftmax(resource, scaleValue, softcapValue);
             EpilogueRescaleO epilogueRescaleO(resource);
             EpilogueInitOut epilogueInitOut(resource);
             coreIdx = AscendC::GetBlockIdx() / AscendC::GetSubBlockNum();

@@ -88,7 +88,7 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     TORCH_CHECK(!leftpad_k_.has_value(), "NPU FlashAttention does not support leftpad_k");
     TORCH_CHECK(!rotary_cos_.has_value(), "NPU FlashAttention does not support rotary embedding");
     TORCH_CHECK(!rotary_sin_.has_value(), "NPU FlashAttention does not support rotary embedding");
-    TORCH_CHECK(softcap == 0.0f, "NPU FlashAttention does not support softcap");
+    TORCH_CHECK(softcap >= 0.0f, "softcap must be non-negative (0.0 disables softcap)");
     TORCH_CHECK(window_size_left == -1, "NPU FlashAttention does not support window_size_left");
     TORCH_CHECK(window_size_right == -1, "NPU FlashAttention does not support window_size_right");
     TORCH_CHECK(num_splits == 1 || num_splits == 0, "NPU FlashAttention only supports num_splits=1 or num_splits=0");
@@ -141,7 +141,13 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     tiling_cpu_ptr->set_blockSize(static_cast<uint32_t>(page_block_size));
     tiling_cpu_ptr->set_maxNumBlocksPerBatch(static_cast<uint32_t>(max_num_blocks_per_seq));
     tiling_cpu_ptr->set_maskType(static_cast<uint32_t>(is_causal));
-    tiling_cpu_ptr->set_scaleValue(softmax_scale);
+    if (softcap > 0.0f) {
+        tiling_cpu_ptr->set_scaleValue(softmax_scale / softcap);
+        tiling_cpu_ptr->set_softcapValue(softcap);
+    } else {
+        tiling_cpu_ptr->set_scaleValue(softmax_scale);
+        tiling_cpu_ptr->set_softcapValue(0.0f);
+    }
     tiling_cpu_ptr->set_maxQSeqlen(seqlen_q);
     uint64_t WORKSPACE_BLOCK_SIZE_DB = 128 * 512;
     uint64_t PRELANCH_NUM = 3;
@@ -362,6 +368,7 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
     tiling_cpu_ptr->set_maxNumBlocksPerBatch(static_cast<uint32_t>(0));
     tiling_cpu_ptr->set_maskType(static_cast<uint32_t>(is_causal));
     tiling_cpu_ptr->set_scaleValue(softmax_scale);
+    tiling_cpu_ptr->set_softcapValue(0.0f);
     tiling_cpu_ptr->set_maxQSeqlen(seqlen_q);
     tiling_cpu_ptr->set_mm1OutSize(mm1OutSize);
     tiling_cpu_ptr->set_smOnlineOutSize(smOnlineOutSize);
@@ -528,6 +535,7 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     tiling_cpu_ptr->set_maxNumBlocksPerBatch(static_cast<uint32_t>(max_num_blocks_per_seq)); //0
     tiling_cpu_ptr->set_maskType(static_cast<uint32_t>(is_causal));
     tiling_cpu_ptr->set_scaleValue(softmax_scale);
+    tiling_cpu_ptr->set_softcapValue(0.0f);
     tiling_cpu_ptr->set_maxQSeqlen(max_seqlen_q);
     
     uint64_t WORKSPACE_BLOCK_SIZE_DB = 128 * 512;  // 工作空间块大小 ，每次计算128 * 512
