@@ -354,7 +354,6 @@ void FAG(uint64_t fftsAddr,
 {
     // Set FFTS address
     AscendC::SetSyncBaseAddr(fftsAddr);
-    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
     
     #if defined(ENABLE_ASCENDC_DUMP)
         AscendC::InitDump(false, ptrDump, ALL_DUMPSIZE);
