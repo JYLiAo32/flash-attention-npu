@@ -95,6 +95,7 @@ namespace SplitFuse {
             uint32_t blockSize = fATilingData->blockSize;
             uint32_t maskType = fATilingData->maskType;
             float scaleValue = fATilingData->scaleValue;
+            float softcapValue = fATilingData->softcapValue;
             AscendC::GlobalTensor<ElementQ> gQ;
             gQ.SetGlobalBuffer((__gm__ ElementQ *)params.q);
             AscendC::GlobalTensor<ElementK> gK;
@@ -179,7 +180,7 @@ namespace SplitFuse {
             AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID2);
             AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID3);
 
-            EpilogueOnlineSoftmax epilogueOnlineSoftmax(resource, scaleValue);
+            EpilogueOnlineSoftmax epilogueOnlineSoftmax(resource, scaleValue, softcapValue);
             EpilogueRescaleO epilogueRescaleO(resource);
             EpilogueInitOut epilogueInitOut(resource);
             coreIdx = AscendC::GetBlockIdx() / AscendC::GetSubBlockNum();
@@ -586,7 +587,8 @@ namespace SplitFuse {
         bool PagedCacheFlag = false,
         FaiKenel::MaskType maskCategory = FaiKenel::MaskType::NO_MASK,
         FaiKenel::inputLayout inLayout = FaiKenel::inputLayout::TND,
-        Epilogue::LseModeT lseMode = Epilogue::LseModeT::NONE>
+        Epilogue::LseModeT lseMode = Epilogue::LseModeT::NONE,
+        bool isSoftCap = false>
     __global__ __aicore__ void FAInfer(
         uint64_t fftsAddr,
         GM_ADDR q,
@@ -634,7 +636,7 @@ namespace SplitFuse {
         using BlockMmadQK = Gemm::Block::BlockMmad<DispatchPolicyQK, L1TileShapeQK, L0TileShapeQK,
                                                    QType, KType, SType>;
 
-        using DispatchPolicyOnlineSoftmax = Epilogue::EpilogueAtlasA2OnlineSoftmaxT<lseMode, IntermCalcPrec>;
+        using DispatchPolicyOnlineSoftmax = Epilogue::EpilogueAtlasA2OnlineSoftmaxT<lseMode, IntermCalcPrec, isSoftCap>;
         using PType = Gemm::GemmType<ElementP, LayoutP>;
         using maskType = Gemm::GemmType<ElementMask, LayoutMask>;
         using EpilogueOnlineSoftmax =

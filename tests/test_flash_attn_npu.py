@@ -88,6 +88,7 @@ def ref_flash_attention(
     scale,
     mask,
     data_type,
+    softcap=0.0,
     ):
     inner_prec = 0
     interm_dtype = torch.float16 if inner_prec == 1 else torch.float32
@@ -115,7 +116,16 @@ def ref_flash_attention(
             sub_mask = mask[:query.shape[1], kv_start : kv_start + sub_len].to(interm_dtype) * (-1e4)
         sub_value = value[:, kv_start: kv_start + sub_len, :]
         qk_result = qkMM1(query, sub_key).to(interm_dtype)
-        qk_result = qk_result * scale
+        if softcap > 0.0:
+            qk_result = qk_result * (scale / softcap)
+            qk_result = qk_result * (-2.0)
+            qk_result = torch.exp(qk_result)
+            qk_result = qk_result + 1.0
+            qk_result = torch.reciprocal(qk_result)
+            qk_result = qk_result * (2.0 * softcap)
+            qk_result = qk_result - softcap
+        else:
+            qk_result = qk_result * scale
         if mask is not None:
             qk_result += sub_mask
         if kv_start == 0:
@@ -140,18 +150,22 @@ def ref_flash_attention(
     return go.to(data_type), lse
 
 test_cases = [
-    # (data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal)
-    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, 1, 128, False),
-    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, 0, 128, True),
-    (torch.float16, 7, 1, 1, 512, 512, 128, 1, 128, False),
+    # (data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal, softcap)
+    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, 1, 128, False, 0.0),
+    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, 0, 128, True,  0.0),
+    (torch.float16,  7, 1, 1, 512,  512,  128, 1, 128, False, 0.0),
+    # softcap-enabled cases
+    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, 1, 128, False, 30.0),
+    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, 0, 128, False, 30.0),
+    (torch.float16,  7, 1, 1, 512,  512,  128, 1, 128, False, 50.0),
 ]
 
-@pytest.mark.parametrize("data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal", test_cases)
-def test_fa_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal):
-    q_min_range = -5.0
-    q_max_range = 5.0
-    kv_min_range = -5.0
-    kv_max_range = 5.0
+@pytest.mark.parametrize("data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal, softcap", test_cases)
+def test_fa_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal, softcap):
+    q_min_range = -1.0
+    q_max_range = 1.0
+    kv_min_range = -1.0
+    kv_max_range = 1.0
     block_size = 128
     num_blocks = 64
     query = (q_min_range + (q_max_range - q_min_range) * torch.rand(batch_size, q_seqlen, num_heads, head_size)).to(data_type).npu()
@@ -178,7 +192,6 @@ def test_fa_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_
     window_size_left = -1
     window_size_right = -1
     is_rotary_interleaved = False
-    softcap = 0
     num_splits = 0
     kv_seqlen_list = torch.tensor(kv_seqlen_list, dtype=torch.int32).npu()
     rotary_cos = None
@@ -200,6 +213,7 @@ def test_fa_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_
         block_table=block_tables,
         causal=is_causal,
         window_size=[window_size_left, window_size_right],
+        softcap=softcap,
         rotary_interleaved=is_rotary_interleaved,
         alibi_slopes=alibi_slopes,
         num_splits=num_splits,
@@ -233,9 +247,9 @@ def test_fa_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_
             value_cache_per_batch = value_cache.detach().cpu()[i]
         query_cpu = query.detach().cpu()[i]
         if is_causal:
-            output, golden_lse = ref_flash_attention(query_cpu, key_cache_per_batch, value_cache_per_batch, scale, atten_mask, data_type)
+            output, golden_lse = ref_flash_attention(query_cpu, key_cache_per_batch, value_cache_per_batch, scale, atten_mask, data_type, softcap)
         else:
-            output, golden_lse = ref_flash_attention(query_cpu, key_cache_per_batch, value_cache_per_batch, scale, None, data_type)
+            output, golden_lse = ref_flash_attention(query_cpu, key_cache_per_batch, value_cache_per_batch, scale, None, data_type, softcap)
         out = output.reshape(q_seqlen, num_heads, head_size)
         golden_out[i:i+1] = out
         golden_lseL[i:i+1] = torch.transpose(golden_lse.reshape(num_heads, q_seqlen), 0, 1)

@@ -22,15 +22,16 @@ template <
     class OutputType_,
     class InputType_,
     class MaskType_,
-    LseModeT LSE_MODE_>
+    LseModeT LSE_MODE_,
+    bool IsSoftCap_>
 class BlockEpilogue<
-    EpilogueAtlasA2OnlineSoftmaxT<LSE_MODE_, half>,
+    EpilogueAtlasA2OnlineSoftmaxT<LSE_MODE_, half, IsSoftCap_>,
     OutputType_,
     InputType_,
     MaskType_>
 {
 public:
-    using DispatchPolicy = EpilogueAtlasA2OnlineSoftmaxT<LSE_MODE_, half>;
+    using DispatchPolicy = EpilogueAtlasA2OnlineSoftmaxT<LSE_MODE_, half, IsSoftCap_>;
     using ArchTag = typename DispatchPolicy::ArchTag;
     using ElementOutput = typename OutputType_::Element;
     using ElementInput = typename InputType_::Element;
@@ -64,7 +65,7 @@ public:
     static constexpr uint32_t SPLIT_COL_IDX_2 = 2;
     static constexpr uint32_t SPLIT_COL_IDX_3 = 3;
     __aicore__ inline
-    BlockEpilogue(Arch::Resource<ArchTag> &resource, float scaleValue_)
+    BlockEpilogue(Arch::Resource<ArchTag> &resource, float scaleValue_, float /*softcapValue_*/ = 0.0f)
     {
         // Allocate UB space
         constexpr uint32_t LS_UB_TENSOR_OFFSET = 0;
