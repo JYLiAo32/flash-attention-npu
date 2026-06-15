@@ -29,7 +29,7 @@ struct FAGInfo {
     int64_t valueShape_1;
 };
 
-int32_t GetFATilingParam(const FAGInfo fagInfo, uint32_t &blockDim, int64_t *tilingHost)
+int32_t GetFATilingParam(const FAGInfo fagInfo, uint32_t &blockDim, int64_t *tilingHost, uint64_t& workspaceSize)
 {
     auto *fagV2TilingData = reinterpret_cast<FAGv2TilingData *>(tilingHost);
     std::memset(fagV2TilingData, 0, sizeof(FAGv2TilingData));
@@ -119,6 +119,7 @@ int32_t GetFATilingParam(const FAGInfo fagInfo, uint32_t &blockDim, int64_t *til
     fagV2TilingData->dsWorkSpaceOffset = workspaceOffset;
     workspaceOffset = 
         (workspaceOffset + coreNum * matmulSize * size_of_half * DB_NUM + GM_ALIGN) / GM_ALIGN * GM_ALIGN;
+    workspaceSize = workspaceOffset;
 
     std::memcpy(&(fagV2TilingData->softmaxTilingData), &softmaxTilingData, sizeof(SoftMaxTiling));
     std::memcpy(&(fagV2TilingData->softmaxGradTilingData), &softmaxGradTilingData, sizeof(SoftMaxTiling));
