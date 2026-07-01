@@ -159,6 +159,145 @@ def flash_attn_with_kvcache(
     """
 ```
 
+#### flash_attn_func
+
+```python
+def flash_attn_func(
+    q,
+    k,
+    v,
+    dropout_p=0.0,
+    softmax_scale=None,
+    causal=False,
+    window_size=(-1, -1),  # -1 表示无限上下文窗口
+    softcap=0.0,  # <=0.0 表示不启用
+    alibi_slopes=None,
+    deterministic=False,
+    return_attn_probs=False,
+):
+    """
+    评估时应将 dropout_p 设为 0.0。
+
+    支持多查询注意力和分组查询注意力（MQA/GQA），通过传入比 Q 头数少的 K、V 来实现。
+    注意 Q 的头数必须能被 K、V 的头数整除。
+    例如，如果 Q 有 6 个头，K、V 有 2 个头，那么 Q 的头 0、1、2 将关注 K、V 的头 0，
+    Q 的头 3、4、5 将关注 K、V 的头 1。
+
+    如果 causal=True，因果掩码对齐到注意力矩阵的右下角。
+    例如，如果 seqlen_q = 2 且 seqlen_k = 5，因果掩码（1 = 保留，0 = 掩码）为：
+        1 1 1 1 0
+        1 1 1 1 1
+    如果 seqlen_q = 5 且 seqlen_k = 2，因果掩码为：
+        0 0
+        0 0
+        0 0
+        1 0
+        1 1
+    如果掩码的某一行全为零，输出将为零。
+
+    如果 window_size != (-1, -1)，实现滑动窗口局部注意力。
+    位置 i 的 query 只会关注 [i + seqlen_k - seqlen_q - window_size[0], i + seqlen_k - seqlen_q + window_size[1]] 范围内的 key。
+
+    参数：
+        q: (batch_size, seqlen, nheads, headdim)
+        k: (batch_size, seqlen, nheads_k, headdim)
+        v: (batch_size, seqlen, nheads_k, headdim)
+        dropout_p: float。Dropout 概率。
+        softmax_scale: float。softmax 前对 QK^T 的缩放。默认为 1 / sqrt(headdim)。
+        causal: bool。是否应用因果注意力掩码（例如用于自回归建模）。
+        window_size: (left, right)。如果 != (-1, -1)，实现滑动窗口局部注意力。
+        softcap: float。大于 0 时激活 softcapping 注意力。
+        alibi_slopes: (nheads,) 或 (batch_size, nheads)，fp32。
+            将 (-alibi_slope * |i + seqlen_k - seqlen_q - j|) 的偏置加到
+            query i 和 key j 的注意力分数上。
+        deterministic: bool。是否使用反向传播的确定性实现（稍慢且占用更多内存）。
+            前向传播始终是确定性的。
+        return_attn_probs: bool。是否返回注意力概率。此选项仅用于测试，
+            返回的概率不保证正确（缩放可能不正确）。
+
+    返回：
+        out: (batch_size, seqlen, nheads, headdim)。
+        softmax_lse [可选，return_attn_probs=True 时]: (batch_size, nheads, seqlen)。
+            QK^T * scaling 每行的 logsumexp（即 softmax 归一化因子的对数）。
+        S_dmask [可选，return_attn_probs=True 时]: (batch_size, nheads, seqlen, seqlen)。
+            softmax 的输出（缩放可能不同），同时编码 dropout 模式
+            （负值表示该位置被丢弃，非负值表示保留）。
+    """
+```
+
+#### flash_attn_varlen_func
+
+```python
+def flash_attn_varlen_func(
+    q,
+    k,
+    v,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    max_seqlen_q,
+    max_seqlen_k,
+    dropout_p=0.0,
+    softmax_scale=None,
+    causal=False,
+    window_size=(-1, -1),  # -1 表示无限上下文窗口
+    softcap=0.0,  # <=0.0 表示不启用
+    alibi_slopes=None,
+    deterministic=False,
+    return_attn_probs=False,
+    block_table=None,
+):
+    """
+    评估时应将 dropout_p 设为 0.0。
+
+    支持变长序列：Q、K、V 按 token 拼接存储，通过 cu_seqlens 索引各序列边界。
+    支持多查询注意力和分组查询注意力（MQA/GQA），通过传入比 Q 头数少的 K、V 来实现。
+    注意 Q 的头数必须能被 K、V 的头数整除。
+
+    如果 causal=True，因果掩码对齐到注意力矩阵的右下角。
+    例如，如果 seqlen_q = 2 且 seqlen_k = 5，因果掩码（1 = 保留，0 = 掩码）为：
+        1 1 1 1 0
+        1 1 1 1 1
+    如果 seqlen_q = 5 且 seqlen_k = 2，因果掩码为：
+        0 0
+        0 0
+        0 0
+        1 0
+        1 1
+    如果掩码的某一行全为零，输出将为零。
+
+    如果 window_size != (-1, -1)，实现滑动窗口局部注意力。
+    位置 i 的 query 只会关注 [i + seqlen_k - seqlen_q - window_size[0], i + seqlen_k - seqlen_q + window_size[1]] 范围内的 key。
+
+    参数：
+        q: (total_q, nheads, headdim)，total_q 为批次中 query token 总数。
+        k: (total_k, nheads_k, headdim)，total_k 为批次中 key token 总数。
+        v: (total_k, nheads_k, headdim)，total_k 为批次中 value token 总数。
+        cu_seqlens_q: (batch_size + 1,)，dtype 为 torch.int32。用于索引 q 的累积序列长度。
+        cu_seqlens_k: (batch_size + 1,)，dtype 为 torch.int32。用于索引 k、v 的累积序列长度。
+        max_seqlen_q: int。批次中最大 query 序列长度。
+        max_seqlen_k: int。批次中最大 key 序列长度。
+        dropout_p: float。Dropout 概率。
+        softmax_scale: float。softmax 前对 QK^T 的缩放。默认为 1 / sqrt(headdim)。
+        causal: bool。是否应用因果注意力掩码（例如用于自回归建模）。
+        window_size: (left, right)。如果 != (-1, -1)，实现滑动窗口局部注意力。
+        softcap: float。大于 0 时激活 softcapping 注意力。
+        alibi_slopes: (nheads,) 或 (batch_size, nheads)，fp32。
+            将 (-alibi_slope * |i + seqlen_k - seqlen_q - j|) 的偏置加到
+            query i 和 key j 的注意力分数上。
+        deterministic: bool。是否使用反向传播的确定性实现（稍慢且占用更多内存）。
+            前向传播始终是确定性的。
+        return_attn_probs: bool。是否返回注意力概率。此选项仅用于测试。
+        block_table [可选]: 分页 KV 缓存的块表。
+
+    返回：
+        out: (total_q, nheads, headdim)。
+        softmax_lse [可选，return_attn_probs=True 时]: (nheads, total_q)。
+            QK^T * scaling 每行的 logsumexp（即 softmax 归一化因子的对数）。
+        S_dmask [可选，return_attn_probs=True 时]: (batch_size, nheads, seqlen, seqlen)。
+            softmax 的输出，同时编码 dropout 模式。
+    """
+```
+
 ### FlashAttention v3
 
 #### flash_attn_with_kvcache
@@ -250,6 +389,142 @@ def flash_attn_with_kvcache(
     """
 ```
 
+#### flash_attn_func
+
+```python
+def flash_attn_func(
+    q,
+    k,
+    v,
+    softmax_scale=None,
+    causal=False,
+    qv=None,
+    q_descale=None,
+    k_descale=None,
+    v_descale=None,
+    window_size=(-1, -1),
+    attention_chunk=0,
+    softcap=0.0,
+    num_splits=1,
+    pack_gqa=None,
+    deterministic=False,
+    sm_margin=0,
+    return_attn_probs=False,
+):
+    """
+    v3 版本的标准注意力接口，相比 v2 增加了 FP8 反量化、attention_chunk 等参数。
+
+    支持多查询注意力和分组查询注意力（MQA/GQA），通过传入比 Q 头数少的 K、V 来实现。
+    注意 Q 的头数必须能被 K、V 的头数整除。
+
+    如果 causal=True，因果掩码对齐到注意力矩阵的右下角。
+    例如，如果 seqlen_q = 2 且 seqlen_k = 5，因果掩码（1 = 保留，0 = 掩码）为：
+        1 1 1 1 0
+        1 1 1 1 1
+    如果 seqlen_q = 5 且 seqlen_k = 2，因果掩码为：
+        0 0
+        0 0
+        0 0
+        1 0
+        1 1
+    如果掩码的某一行全为零，输出将为零。
+
+    如果 window_size != (-1, -1)，实现滑动窗口局部注意力。
+    位置 i 的 query 只会关注 [i + seqlen_k - seqlen_q - window_size[0], i + seqlen_k - seqlen_q + window_size[1]] 范围内的 key。
+
+    参数：
+        q: (batch_size, seqlen, nheads, headdim)
+        k: (batch_size, seqlen, nheads_k, headdim)
+        v: (batch_size, seqlen, nheads_k, headdim)
+        softmax_scale: float。softmax 前对 QK^T 的缩放。默认为 1 / sqrt(headdim)。
+        causal: bool。是否应用因果注意力掩码（例如用于自回归建模）。
+        qv [可选]: (batch_size, seqlen, nheads, headdim_v)。
+        q_descale, k_descale, v_descale: 可选，用于 FP8 量化的反缩放因子。
+        window_size: (left, right)。如果 != (-1, -1)，实现滑动窗口局部注意力。
+        attention_chunk: int。注意力分块大小。
+        softcap: float。大于 0 时激活 softcapping 注意力。
+        num_splits: int。如果 > 1，将 key/value 在序列维度上分割成这么多块。
+            如果 num_splits == 1，不分割。如果 num_splits == 0，自动选择。
+        pack_gqa: bool。是否打包 GQA 以提高性能。
+        deterministic: bool。是否使用反向传播的确定性实现。
+        sm_margin: int。SM 边际，用于调优。
+        return_attn_probs: bool。是否返回注意力概率。此选项仅用于测试。
+
+    返回：
+        out: (batch_size, seqlen, nheads, headdim)。
+        softmax_lse [可选，return_attn_probs=True 时]: (batch_size, nheads, seqlen)。
+            QK^T * scaling 每行的 logsumexp。
+    """
+```
+
+#### flash_attn_varlen_func
+
+```python
+def flash_attn_varlen_func(
+    q,
+    k,
+    v,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    max_seqlen_q,
+    max_seqlen_k,
+    seqused_q=None,
+    seqused_k=None,
+    softmax_scale=None,
+    causal=False,
+    qv=None,
+    q_descale=None,
+    k_descale=None,
+    v_descale=None,
+    window_size=(-1, -1),
+    attention_chunk=0,
+    softcap=0.0,
+    num_splits=1,
+    pack_gqa=None,
+    deterministic=False,
+    sm_margin=0,
+    return_attn_probs=False,
+):
+    """
+    v3 版本的变长序列注意力接口。
+
+    支持变长序列：Q、K、V 按 token 拼接存储，通过 cu_seqlens 索引各序列边界。
+    支持多查询注意力和分组查询注意力（MQA/GQA）。
+
+    如果 causal=True，因果掩码对齐到注意力矩阵的右下角。
+
+    如果 window_size != (-1, -1)，实现滑动窗口局部注意力。
+
+    参数：
+        q: (total_q, nheads, headdim)，total_q 为批次中 query token 总数。
+        k: (total_k, nheads_k, headdim)，total_k 为批次中 key token 总数。
+        v: (total_k, nheads_k, headdim)，total_k 为批次中 value token 总数。
+        cu_seqlens_q: (batch_size + 1,)，dtype 为 torch.int32。用于索引 q 的累积序列长度。
+        cu_seqlens_k: (batch_size + 1,)，dtype 为 torch.int32。用于索引 k、v 的累积序列长度。
+        max_seqlen_q: int。批次中最大 query 序列长度。
+        max_seqlen_k: int。批次中最大 key 序列长度。
+        seqused_q [可选]: 实际使用的 query 序列长度。
+        seqused_k [可选]: 实际使用的 key 序列长度。
+        softmax_scale: float。softmax 前对 QK^T 的缩放。默认为 1 / sqrt(headdim)。
+        causal: bool。是否应用因果注意力掩码。
+        qv [可选]: 额外的 query value 张量。
+        q_descale, k_descale, v_descale: 可选，用于 FP8 量化的反缩放因子。
+        window_size: (left, right)。如果 != (-1, -1)，实现滑动窗口局部注意力。
+        attention_chunk: int。注意力分块大小。
+        softcap: float。大于 0 时激活 softcapping 注意力。
+        num_splits: int。key/value 序列维度分割块数。
+        pack_gqa: bool。是否打包 GQA 以提高性能。
+        deterministic: bool。是否使用反向传播的确定性实现。
+        sm_margin: int。SM 边际，用于调优。
+        return_attn_probs: bool。是否返回注意力概率。此选项仅用于测试。
+
+    返回：
+        out: (total_q, nheads, headdim)。
+        softmax_lse [可选，return_attn_probs=True 时]: (nheads, total_q)。
+            QK^T * scaling 每行的 logsumexp。
+    """
+```
+
 ## 特性
 
 #### flash_attn_with_kvcache
@@ -266,6 +541,36 @@ def flash_attn_with_kvcache(
 | Softcapping | - | - |
 | FP8 量化 | - | - |
 | 变长序列 | ✅ | ✅ |
+
+#### flash_attn_func
+| 特性 | v2 | v3 |
+|------|----|----|
+| FP16 (float16) | ✅ | ✅ |
+| BF16 (bfloat16) | ✅ | ✅ |
+| 因果注意力 (Causal) | ✅ | ✅ |
+| 滑动窗口注意力 | - | - |
+| MQA/GQA | ✅ | ✅ |
+| 反向传播 | ✅ | ✅ |
+| ALiBi | - | - |
+| Softcapping | - | - |
+| FP8 量化 | - | - |
+| Dropout | - | - |
+
+#### flash_attn_varlen_func
+| 特性 | v2 | v3 |
+|------|----|----|
+| FP16 (float16) | ✅ | ✅ |
+| BF16 (bfloat16) | ✅ | ✅ |
+| 因果注意力 (Causal) | ✅ | ✅ |
+| 滑动窗口注意力 | - | - |
+| MQA/GQA | ✅ | ✅ |
+| 反向传播 | ✅ | ✅ |
+| 变长序列 | ✅ | ✅ |
+| 分页 KV 缓存 | - | - |
+| ALiBi | - | - |
+| Softcapping | - | - |
+| FP8 量化 | - | - |
+| Dropout | - | - |
 
 
 

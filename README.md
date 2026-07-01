@@ -165,6 +165,149 @@ def flash_attn_with_kvcache(
     """
 ```
 
+#### flash_attn_func
+
+```python
+def flash_attn_func(
+    q,
+    k,
+    v,
+    dropout_p=0.0,
+    softmax_scale=None,
+    causal=False,
+    window_size=(-1, -1),  # -1 means infinite context window
+    softcap=0.0,  # <=0.0 means deactivated
+    alibi_slopes=None,
+    deterministic=False,
+    return_attn_probs=False,
+):
+    """
+    dropout_p should be set to 0.0 during evaluation.
+
+    Multi-query and grouped-query attention (MQA/GQA) are supported by passing in K, V with fewer
+    heads than Q. Q head count must be divisible by K, V head count.
+    For example, if Q has 6 heads and K, V have 2 heads, then Q heads 0, 1, 2 will attend to
+    K, V head 0, and Q heads 3, 4, 5 will attend to K, V head 1.
+
+    If causal=True, the causal mask is aligned to the bottom-right corner of the attention matrix.
+    For example, if seqlen_q = 2 and seqlen_k = 5, the causal mask (1 = keep, 0 = mask) is:
+        1 1 1 1 0
+        1 1 1 1 1
+    If seqlen_q = 5 and seqlen_k = 2, the causal mask is:
+        0 0
+        0 0
+        0 0
+        1 0
+        1 1
+    If a row of the mask is all zeros, the output will be zero.
+
+    If window_size != (-1, -1), implements sliding window local attention.
+    Query at position i will only attend to keys in [i + seqlen_k - seqlen_q - window_size[0],
+    i + seqlen_k - seqlen_q + window_size[1]].
+
+    Arguments:
+        q: (batch_size, seqlen, nheads, headdim)
+        k: (batch_size, seqlen, nheads_k, headdim)
+        v: (batch_size, seqlen, nheads_k, headdim)
+        dropout_p: float. Dropout probability.
+        softmax_scale: float. The scaling of QK^T before applying softmax. Default to 1 / sqrt(headdim).
+        causal: bool. Whether to apply causal attention mask (e.g., for autoregressive modeling).
+        window_size: (left, right). If not (-1, -1), implements sliding window local attention.
+        softcap: float. Activates softcapping attention if > 0.
+        alibi_slopes: (nheads,) or (batch_size, nheads), fp32.
+            Add bias to the attention scores of query i and key j of
+            (-alibi_slope * |i + seqlen_k - seqlen_q - j|).
+        deterministic: bool. Whether to use the deterministic implementation of the backward pass,
+            which is slightly slower and uses more memory. The forward pass is always deterministic.
+        return_attn_probs: bool. Whether to return the attention probabilities. This option is for
+            testing only. The returned probabilities are not guaranteed to be correct
+            (they might not have the right scaling).
+
+    Returns:
+        out: (batch_size, seqlen, nheads, headdim).
+        softmax_lse [optional, if return_attn_probs=True]: (batch_size, nheads, seqlen).
+            The logsumexp of each row of QK^T * scaling (e.g., log of the softmax normalization factor).
+        S_dmask [optional, if return_attn_probs=True]: (batch_size, nheads, seqlen, seqlen).
+            The output of softmax (possibly with different scaling). It also encodes the dropout
+            pattern (negative means that location was dropped, nonnegative means it was kept).
+    """
+```
+
+#### flash_attn_varlen_func
+
+```python
+def flash_attn_varlen_func(
+    q,
+    k,
+    v,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    max_seqlen_q,
+    max_seqlen_k,
+    dropout_p=0.0,
+    softmax_scale=None,
+    causal=False,
+    window_size=(-1, -1),  # -1 means infinite context window
+    softcap=0.0,  # <=0.0 means deactivated
+    alibi_slopes=None,
+    deterministic=False,
+    return_attn_probs=False,
+    block_table=None,
+):
+    """
+    dropout_p should be set to 0.0 during evaluation.
+
+    Supports variable-length sequences: Q, K, V are stored as concatenated tokens, indexed by
+    cu_seqlens for sequence boundaries.
+    Multi-query and grouped-query attention (MQA/GQA) are supported by passing in K, V with fewer
+    heads than Q. Q head count must be divisible by K, V head count.
+
+    If causal=True, the causal mask is aligned to the bottom-right corner of the attention matrix.
+    For example, if seqlen_q = 2 and seqlen_k = 5, the causal mask (1 = keep, 0 = mask) is:
+        1 1 1 1 0
+        1 1 1 1 1
+    If seqlen_q = 5 and seqlen_k = 2, the causal mask is:
+        0 0
+        0 0
+        0 0
+        1 0
+        1 1
+    If a row of the mask is all zeros, the output will be zero.
+
+    If window_size != (-1, -1), implements sliding window local attention.
+    Query at position i will only attend to keys in [i + seqlen_k - seqlen_q - window_size[0],
+    i + seqlen_k - seqlen_q + window_size[1]].
+
+    Arguments:
+        q: (total_q, nheads, headdim), where total_q is the total number of query tokens in the batch.
+        k: (total_k, nheads_k, headdim), where total_k is the total number of key tokens in the batch.
+        v: (total_k, nheads_k, headdim), where total_k is the total number of value tokens in the batch.
+        cu_seqlens_q: (batch_size + 1,), dtype torch.int32. Cumulative sequence lengths used to index q.
+        cu_seqlens_k: (batch_size + 1,), dtype torch.int32. Cumulative sequence lengths used to index k, v.
+        max_seqlen_q: int. Maximum query sequence length in the batch.
+        max_seqlen_k: int. Maximum key sequence length in the batch.
+        dropout_p: float. Dropout probability.
+        softmax_scale: float. The scaling of QK^T before applying softmax. Default to 1 / sqrt(headdim).
+        causal: bool. Whether to apply causal attention mask (e.g., for autoregressive modeling).
+        window_size: (left, right). If not (-1, -1), implements sliding window local attention.
+        softcap: float. Activates softcapping attention if > 0.
+        alibi_slopes: (nheads,) or (batch_size, nheads), fp32.
+            Add bias to the attention scores of query i and key j of
+            (-alibi_slope * |i + seqlen_k - seqlen_q - j|).
+        deterministic: bool. Whether to use the deterministic implementation of the backward pass,
+            which is slightly slower and uses more memory. The forward pass is always deterministic.
+        return_attn_probs: bool. Whether to return the attention probabilities. This option is for testing only.
+        block_table [optional]: Block table for paged KV cache.
+
+    Returns:
+        out: (total_q, nheads, headdim).
+        softmax_lse [optional, if return_attn_probs=True]: (nheads, total_q).
+            The logsumexp of each row of QK^T * scaling.
+        S_dmask [optional, if return_attn_probs=True]: (batch_size, nheads, seqlen, seqlen).
+            The output of softmax, also encoding the dropout pattern.
+    """
+```
+
 ### FlashAttention v3
 
 #### flash_attn_with_kvcache
@@ -257,6 +400,145 @@ def flash_attn_with_kvcache(
     """
 ```
 
+#### flash_attn_func
+
+```python
+def flash_attn_func(
+    q,
+    k,
+    v,
+    softmax_scale=None,
+    causal=False,
+    qv=None,
+    q_descale=None,
+    k_descale=None,
+    v_descale=None,
+    window_size=(-1, -1),
+    attention_chunk=0,
+    softcap=0.0,
+    num_splits=1,
+    pack_gqa=None,
+    deterministic=False,
+    sm_margin=0,
+    return_attn_probs=False,
+):
+    """
+    v3 version of the standard attention interface, with additional parameters such as FP8
+    dequantization and attention_chunk compared to v2.
+
+    Multi-query and grouped-query attention (MQA/GQA) are supported by passing in K, V with fewer
+    heads than Q. Q head count must be divisible by K, V head count.
+
+    If causal=True, the causal mask is aligned to the bottom-right corner of the attention matrix.
+    For example, if seqlen_q = 2 and seqlen_k = 5, the causal mask (1 = keep, 0 = mask) is:
+        1 1 1 1 0
+        1 1 1 1 1
+    If seqlen_q = 5 and seqlen_k = 2, the causal mask is:
+        0 0
+        0 0
+        0 0
+        1 0
+        1 1
+    If a row of the mask is all zeros, the output will be zero.
+
+    If window_size != (-1, -1), implements sliding window local attention.
+    Query at position i will only attend to keys in [i + seqlen_k - seqlen_q - window_size[0],
+    i + seqlen_k - seqlen_q + window_size[1]].
+
+    Arguments:
+        q: (batch_size, seqlen, nheads, headdim)
+        k: (batch_size, seqlen, nheads_k, headdim)
+        v: (batch_size, seqlen, nheads_k, headdim)
+        softmax_scale: float. The scaling of QK^T before applying softmax. Default to 1 / sqrt(headdim).
+        causal: bool. Whether to apply causal attention mask (e.g., for autoregressive modeling).
+        qv [optional]: (batch_size, seqlen, nheads, headdim_v).
+        q_descale, k_descale, v_descale: Optional dequantization scales for FP8 quantization.
+        window_size: (left, right). If not (-1, -1), implements sliding window local attention.
+        attention_chunk: int. Attention chunk size.
+        softcap: float. Activates softcapping attention if > 0.
+        num_splits: int. If > 1, split key/value along the sequence dimension into this many chunks.
+            If num_splits == 1, no splitting. If num_splits == 0, automatically selected.
+        pack_gqa: bool. Whether to pack GQA for better performance.
+        deterministic: bool. Whether to use the deterministic implementation of the backward pass.
+        sm_margin: int. SM margin for tuning.
+        return_attn_probs: bool. Whether to return the attention probabilities. This option is for testing only.
+
+    Returns:
+        out: (batch_size, seqlen, nheads, headdim).
+        softmax_lse [optional, if return_attn_probs=True]: (batch_size, nheads, seqlen).
+            The logsumexp of each row of QK^T * scaling.
+    """
+```
+
+#### flash_attn_varlen_func
+
+```python
+def flash_attn_varlen_func(
+    q,
+    k,
+    v,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    max_seqlen_q,
+    max_seqlen_k,
+    seqused_q=None,
+    seqused_k=None,
+    softmax_scale=None,
+    causal=False,
+    qv=None,
+    q_descale=None,
+    k_descale=None,
+    v_descale=None,
+    window_size=(-1, -1),
+    attention_chunk=0,
+    softcap=0.0,
+    num_splits=1,
+    pack_gqa=None,
+    deterministic=False,
+    sm_margin=0,
+    return_attn_probs=False,
+):
+    """
+    v3 version of the variable-length sequence attention interface.
+
+    Supports variable-length sequences: Q, K, V are stored as concatenated tokens, indexed by
+    cu_seqlens for sequence boundaries.
+    Multi-query and grouped-query attention (MQA/GQA) are supported.
+
+    If causal=True, the causal mask is aligned to the bottom-right corner of the attention matrix.
+
+    If window_size != (-1, -1), implements sliding window local attention.
+
+    Arguments:
+        q: (total_q, nheads, headdim), where total_q is the total number of query tokens in the batch.
+        k: (total_k, nheads_k, headdim), where total_k is the total number of key tokens in the batch.
+        v: (total_k, nheads_k, headdim), where total_k is the total number of value tokens in the batch.
+        cu_seqlens_q: (batch_size + 1,), dtype torch.int32. Cumulative sequence lengths used to index q.
+        cu_seqlens_k: (batch_size + 1,), dtype torch.int32. Cumulative sequence lengths used to index k, v.
+        max_seqlen_q: int. Maximum query sequence length in the batch.
+        max_seqlen_k: int. Maximum key sequence length in the batch.
+        seqused_q [optional]: Actual query sequence lengths used.
+        seqused_k [optional]: Actual key sequence lengths used.
+        softmax_scale: float. The scaling of QK^T before applying softmax. Default to 1 / sqrt(headdim).
+        causal: bool. Whether to apply causal attention mask.
+        qv [optional]: Additional query value tensor.
+        q_descale, k_descale, v_descale: Optional dequantization scales for FP8 quantization.
+        window_size: (left, right). If not (-1, -1), implements sliding window local attention.
+        attention_chunk: int. Attention chunk size.
+        softcap: float. Activates softcapping attention if > 0.
+        num_splits: int. Number of chunks to split key/value along the sequence dimension.
+        pack_gqa: bool. Whether to pack GQA for better performance.
+        deterministic: bool. Whether to use the deterministic implementation of the backward pass.
+        sm_margin: int. SM margin for tuning.
+        return_attn_probs: bool. Whether to return the attention probabilities. This option is for testing only.
+
+    Returns:
+        out: (total_q, nheads, headdim).
+        softmax_lse [optional, if return_attn_probs=True]: (nheads, total_q).
+            The logsumexp of each row of QK^T * scaling.
+    """
+```
+
 ## Features
 
 #### flash_attn_with_kvcache
@@ -273,6 +555,36 @@ def flash_attn_with_kvcache(
 | Softcapping | - | - |
 | FP8 Quantization | - | - |
 | Variable-length Sequences | ✅ | ✅ |
+
+#### flash_attn_func
+| Feature | v2 | v3 |
+|---------|----|----|
+| FP16 (float16) | ✅ | ✅ |
+| BF16 (bfloat16) | ✅ | ✅ |
+| Causal Attention | ✅ | ✅ |
+| Sliding Window Attention | - | - |
+| MQA/GQA | ✅ | ✅ |
+| Backward Pass | ✅ | ✅ |
+| ALiBi | - | - |
+| Softcapping | - | - |
+| FP8 Quantization | - | - |
+| Dropout | - | - |
+
+#### flash_attn_varlen_func
+| Feature | v2 | v3 |
+|---------|----|----|
+| FP16 (float16) | ✅ | ✅ |
+| BF16 (bfloat16) | ✅ | ✅ |
+| Causal Attention | ✅ | ✅ |
+| Sliding Window Attention | - | - |
+| MQA/GQA | ✅ | ✅ |
+| Backward Pass | ✅ | ✅ |
+| Variable-length Sequences | ✅ | ✅ |
+| Paged KV Cache | - | - |
+| ALiBi | - | - |
+| Softcapping | - | - |
+| FP8 Quantization | - | - |
+| Dropout | - | - |
 
 
 
