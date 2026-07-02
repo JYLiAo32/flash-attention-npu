@@ -26,7 +26,7 @@ body:
     id: alternatives
     attributes:
       label: Alternatives
-      description: What workarounds already exist, and why are they insufficient?
+      description: A description of any alternative solutions or features you've considered, if any.
     validations:
       required: false
   - type: textarea
