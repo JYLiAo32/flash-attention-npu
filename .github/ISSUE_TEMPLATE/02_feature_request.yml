@@ -12,8 +12,7 @@ body:
     id: feature-description
     attributes:
       label: Feature Request
-      description: Describe your feature request.
-      placeholder: A clear and concise description of what you want to happen.
+      description: Describe your feature request. Give a clear and concise description of what you want to happen.
     validations:
       required: true
   - type: textarea
@@ -21,14 +20,13 @@ body:
     attributes:
       label: Motivation
       description: Why do we need this feature?
-      placeholder: Explain the use case or problem you are trying to solve.
     validations:
       required: true
   - type: textarea
     id: alternatives
     attributes:
       label: Alternatives
-      description: What workarounds exist today, and why are they insufficient?
+      description: What workarounds already exist, and why are they insufficient?
     validations:
       required: false
   - type: textarea
@@ -36,6 +34,5 @@ body:
     attributes:
       label: Additional Context
       description: Add any other context that is relevant.
-      render: markdown
     validations:
       required: false
