@@ -119,6 +119,7 @@ namespace SplitFuse {
             windowSizeLeft = fATilingData->windowSizeLeft;
             windowSizeRight = fATilingData->windowSizeRight;
             scaleValue = fATilingData->scaleValue;
+            softcapValue = fATilingData->softcapValue;
             maxQSeqlen = fATilingData->maxQSeqlen;
             flashDecodeFlag = fATilingData->flashDecodeFlag;
 
@@ -230,7 +231,7 @@ namespace SplitFuse {
             AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID2);
             AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID3);
 
-            epilogueOnlineSoftmax.init(resource, scaleValue);
+            epilogueOnlineSoftmax.init(resource, scaleValue, softcapValue);
             epilogueRescaleO.init(resource);
 
             coreIdx = AscendC::GetBlockIdx() / AscendC::GetSubBlockNum();
@@ -981,6 +982,7 @@ namespace SplitFuse {
         int64_t  windowSizeLeft;
         int64_t  windowSizeRight;
         float    scaleValue;
+        float    softcapValue;
         uint32_t totalQTokens;
         uint32_t maxQSeqlen;
         uint32_t flashDecodeFlag;
