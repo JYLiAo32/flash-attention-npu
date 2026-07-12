@@ -1,19 +1,18 @@
 ## Related Issue
 
 <!--
-Use ONE of the following:
+Use the appropriate keyword for each related issue:
+  1) If this PR completely resolves an issue:
+    Fixes #123
+    Closes #123
+    Resolves #123
 
-If this PR completely resolves an issue:
-  Fixes #123
-  Closes #123
-  Resolves #123
+  2) If this PR is related to an issue but should NOT close it:
+    Related to #123
+    Refs #123
 
-If this PR is related to an issue but should NOT close it:
-  Related to #123
-  Refs #123
-
-If there is no related issue, write:
-  None.
+  3) If there is no related issue, write:
+    None.
 -->
 
 
