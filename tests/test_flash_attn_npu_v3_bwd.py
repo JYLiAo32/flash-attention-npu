@@ -1,14 +1,14 @@
 # Copyright (c) 2026, Minghua Shen.
 """
-FlashAttention v2 反向 pytest。
+FlashAttention v3 反向 pytest。
 
 - 正向：flash_attn_func / flash_attn_varlen_func 得到 out / softmax_lse，不与标杆比较
 - 标杆：小算子 fa_small_op_golden（golden_*_bwd_from_fwd，传入 FA out/lse，仅算反传）
 - 被测：torch.autograd.grad（FlashAttnFunc / FlashAttnVarlenFunc）
 
 用法:
-  pytest tests/test_flash_attn_npu_v2_bwd.py -v
-  pytest tests/test_flash_attn_npu_v2_bwd.py -k swa -v
+  pytest tests/test_flash_attn_npu_v3_bwd.py -v
+  pytest tests/test_flash_attn_npu_v3_bwd.py -k swa -v
 """
 
 import gc
@@ -19,13 +19,16 @@ import pytest
 import torch
 import torch_npu
 
-from flash_attn_npu import flash_attn_func, flash_attn_varlen_func
+if "Ascend950" in (torch_npu.npu.get_device_name() if torch_npu.npu.device_count() > 0 else ""):
+    pytest.skip("flash_attn_func / flash_attn_varlen_func not on Ascend950", allow_module_level=True)
+
+from flash_attn_npu_v3 import flash_attn_func, flash_attn_varlen_func
 
 TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
 if TESTS_DIR not in sys.path:
     sys.path.insert(0, TESTS_DIR)
 
-from fa_small_op_golden import golden_bsnd_bwd_from_fwd, golden_tnd_bwd_from_fwd  # noqa: E402
+from fa_small_op_golden import golden_bsnd_bwd_from_fwd, golden_tnd_bwd_from_fwd
 
 RTOL_GOLDEN = 1e-2
 ATOL_GOLDEN = 1e-2
@@ -81,12 +84,12 @@ def run_bsnd_bwd(
     k_ag = key.detach().clone().requires_grad_(True)
     v_ag = value.detach().clone().requires_grad_(True)
     torch.npu.synchronize()
-    out_fa, lse_fa, _ = flash_attn_func(
+    out_fa, lse_fa = flash_attn_func(
         q_ag, k_ag, v_ag,
-        dropout_p=DROPOUT_P,
         softmax_scale=scale,
         causal=is_causal,
-        window_size=window_size,
+        window_size=list(window_size),
+        softcap=0.0,
         return_attn_probs=True,
     )
     dq_ag, dk_ag, dv_ag = torch.autograd.grad(out_fa, (q_ag, k_ag, v_ag), dout)
@@ -115,14 +118,14 @@ def run_varlen_bwd(
     k_ag = key.detach().clone().requires_grad_(True)
     v_ag = value.detach().clone().requires_grad_(True)
     torch.npu.synchronize()
-    out_fa, lse_fa, _ = flash_attn_varlen_func(
+    out_fa, lse_fa = flash_attn_varlen_func(
         q_ag, k_ag, v_ag,
         cu_seqlens_q, cu_seqlens_k,
         max_seqlen_q, max_seqlen_k,
-        dropout_p=DROPOUT_P,
         softmax_scale=scale,
         causal=is_causal,
         window_size=window_size,
+        softcap=0.0,
         return_attn_probs=True,
     )
     dq_ag, dk_ag, dv_ag = torch.autograd.grad(out_fa, (q_ag, k_ag, v_ag), dout)
@@ -212,11 +215,13 @@ def test_fa_bsnd_bwd_swa(
 
 test_cases_varlen = [
     (torch.bfloat16, 1, 1, 1, 512, 1024, 128, True),
-    (torch.float16, 1, 5, 1, 512, 512, 128, True),
-    (torch.float16, 1, 5, 1, 777, 888, 192, False),
-    (torch.float16, 1, 5, 1, 1777, 1888, 256, True),
+    (torch.bfloat16, 2, 4, 4, 1024, 1024, 128, False),
+    (torch.float16, 7, 5, 1, 512, 512, 128, True),
+    (torch.float16, 7, 5, 1, 777, 888, 192, False),
+    (torch.float16, 7, 5, 1, 1777, 1888, 256, True),
     (torch.bfloat16, 1, 1, 1, 7777, 8192, 64, True),
-    (torch.bfloat16, 1, 5, 1, 711, 8192, 111, True),
+    (torch.bfloat16, 7, 5, 1, 711, 8192, 111, True),
+    (torch.bfloat16, 1, 16, 16, 562, 562, 96, False),
 ]
 
 
@@ -251,9 +256,11 @@ def test_fa_varlen_bwd(
 
 
 test_cases_varlen_swa = [
+    (torch.bfloat16, 1, 4, 4, 1024, 1024, 128, True, 512, 0),
     (torch.bfloat16, 1, 1, 1, 512, 1024, 128, True, 512, 0),
     (torch.bfloat16, 1, 1, 1, 512, 1024, 128, False, 0, 256),
     (torch.float16, 1, 2, 2, 512, 512, 128, False, 64, 128),
+    (torch.bfloat16, 1, 4, 4, 1024, 1024, 128, True, -128, 864),
 ]
 
 
