@@ -1049,7 +1049,7 @@ namespace SplitFuse {
         using LayoutO = layout::RowMajor;
         using ElementLse = float;
         using LayoutLse = layout::RowMajor;
-        using ElementMask = int8_t;
+        using ElementMask = uint8_t;
         using LayoutMask = layout::RowMajor;
         using ElementOTmp = IntermCalcPrec;
         using LayoutOTmp = layout::RowMajor;
