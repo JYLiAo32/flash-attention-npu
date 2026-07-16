@@ -347,5 +347,6 @@ mha_fwd(at::Tensor q,
                 sync_err);
 
     at::Tensor empty_accum = at::empty({0}, at::device(at::kPrivateUse1).dtype(at::kFloat));
-    return {out, softmaxlse, empty_accum, empty_accum};
+    at::Tensor empty_softmax_lse_accum = at::empty({0}, at::device(at::kPrivateUse1).dtype(at::kFloat));
+    return {out, softmaxlse, empty_accum, empty_softmax_lse_accum};
 }
