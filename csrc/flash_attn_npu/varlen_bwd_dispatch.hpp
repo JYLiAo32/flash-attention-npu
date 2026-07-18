@@ -22,6 +22,7 @@ struct VarlenBwdLaunchArgs {
     uint64_t fftsAddr;
     bool is_bf16;
     bool is_causal;
+    bool has_alibi;
     uint8_t *qDevice;
     uint8_t *kDevice;
     uint8_t *vDevice;
@@ -34,6 +35,7 @@ struct VarlenBwdLaunchArgs {
     uint8_t *dqDevice;
     uint8_t *dkDevice;
     uint8_t *dvDevice;
+    uint8_t *alibiSlopesDevice;  // may be nullptr when alibi is unused
     uint8_t *workspaceDevice;
     uint8_t *tilingDevice;
 };

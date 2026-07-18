@@ -16,6 +16,7 @@
 #include "kernel_operator.h"
 #include "kernel_common_fag.hpp"
 #include "fag_common/common_header.h"
+#include "alibi.hpp"
 
 using AscendC::CopyRepeatParams;
 using AscendC::DataCopyExtParams;
@@ -38,22 +39,24 @@ template <
     uint32_t INPUT_LAYOUT_,
     uint32_t IS_DROP_,
     uint32_t IS_ATTEN_MASK_,
-    class TilingData
+    class TilingData,
+    bool HAS_ALIBI_
 >
 class BlockEpilogue<
-    EpilogueAtlasA2SameAbVec<INPUT_LAYOUT_, IS_DROP_, IS_ATTEN_MASK_>,
+    EpilogueAtlasA2SameAbVec<INPUT_LAYOUT_, IS_DROP_, IS_ATTEN_MASK_, HAS_ALIBI_>,
     OutputType_,
     InputType_,
     TilingData>
 {
 public:
-    using DispatchPolicy = EpilogueAtlasA2SameAbVec<INPUT_LAYOUT_, IS_DROP_, IS_ATTEN_MASK_>;
+    using DispatchPolicy = EpilogueAtlasA2SameAbVec<INPUT_LAYOUT_, IS_DROP_, IS_ATTEN_MASK_, HAS_ALIBI_>;
     using ArchTag = typename DispatchPolicy::ArchTag;
     using T1 = InputType_;
     using T2 = OutputType_;
     static constexpr uint32_t INPUT_LAYOUT = INPUT_LAYOUT_;
     static constexpr bool IS_DROP = IS_DROP_;
     static constexpr bool IS_ATTEN_MASK = IS_ATTEN_MASK_;
+    static constexpr bool HAS_ALIBI = HAS_ALIBI_;
 
     AscendC::TPipe *pipe;
     TBuf<> unifiedBuffer;
@@ -69,6 +72,12 @@ public:
     GlobalTensor<T1> keyGm, valueGm, dxGm, queryGm, forwardResGm;
     GlobalTensor<uint8_t> maskWorkSpaceGm, attenMaskU8Gm, dropMaskGm;
     GlobalTensor<float> softmaxLseGm;
+
+    GlobalTensor<float> alibiSlopesGm;
+    int64_t alibiSlopesBatchStride = 0;  // 0 for [nheads], stride(0) for [b,nheads]
+    // ALiBi bwd scratch offset: a one-row work buffer (<= s2ExtendAlign, <= 256 floats). Placed in the free UB
+    // gap between the DbBegin region end (~107 KB) and TMP_UB_OFFSET (148 KB). [需 NPU 验证] region is free
+    // and 1 KB-aligned offsets are valid. Slopes are now read directly from GM, not cached in UB.
 
     GlobalTensor<float> dqWorkSpaceGm, dkWorkSpaceGm, dvWorkSpaceGm, sfmgWorkspaceGm;
 
@@ -188,6 +197,8 @@ public:
     constexpr static int64_t GM_DOUBLE_BUFFER = 2;
     constexpr static int64_t TMP_UB_OFFSET = 148 * 1024;
     constexpr static int64_t SFMG_UB_OFFSET = (148 + 33) * 1024;
+    constexpr static int64_t ALIBI_BWD_WORK_UB_OFFSET = 110 * 1024;  // FIXME: 找到合适的位置
+
     constexpr static int64_t TMP_UB_SIZE = 33 * 1024;
     constexpr static int64_t SFMG_UB_SIZE = 8 * 1024;
     constexpr static int64_t TOTAL_SIZE = 189 * 1024;
@@ -215,7 +226,7 @@ public:
                   __gm__ uint8_t *softmax_lse,
                   __gm__ uint8_t *actual_seq_qlen, __gm__ uint8_t *actual_seq_kvlen,
                   __gm__ uint8_t *dq, __gm__ uint8_t *dk,
-                  __gm__ uint8_t *dv,
+                  __gm__ uint8_t *dv, __gm__ uint8_t *alibi_slopes,
                   __gm__ uint8_t *workspace, __gm__ uint8_t *tiling_in, TBuf<>& buf)
     {
         keyGm.SetGlobalBuffer((__gm__ T1 *)key);
@@ -225,6 +236,7 @@ public:
         forwardResGm.SetGlobalBuffer((__gm__ T1 *)forward_res);
         attenMaskU8Gm.SetGlobalBuffer((__gm__ uint8_t *)atten_mask);
         softmaxLseGm.SetGlobalBuffer((__gm__ float *)softmax_lse);
+        alibiSlopesGm.SetGlobalBuffer((__gm__ float *)alibi_slopes);
 
         cBlockIdx = GetBlockIdx();
         cCubeBlockIdx = cBlockIdx / 2;
@@ -291,6 +303,10 @@ public:
         }
         keepProb = tilingData->keepProb;
         scaleValue = tilingData->scaleValue;
+        // ALiBi: the slopes GM pointer arrives as an independent kernel arg (bound in the ctor body
+        // above, like q/k/v); only the batch stride is routed through tiling. ALiBi is compiled in/out
+        // by the HAS_ALIBI template param, so no runtime alibiEnabled flag is needed.
+        alibiSlopesBatchStride = tilingData->alibiSlopesBatchStride;
         compressMode = tilingData->attenMaskCompressMode;
 
         int64_t sfmgOutputSize = b * n2 * g * s1 * 8;
@@ -591,6 +607,12 @@ public:
             static_cast<int64_t>(dropMaskS2Stride) + static_cast<int64_t>(s2VBegin);
     }
 
+    // ALiBi slopes pointer arrives as an independent kernel arg (bound in the ctor, like q/k/v); only
+    // alibiSlopesBatchStride is routed through tiling. ALiBi is compiled in/out by the HAS_ALIBI template
+    // param. The SabVec recompute adds the SAME bias the forward applied, so P (and hence dQ/dK/dV) is
+    // consistent with fwd; the bias is input-independent, so there
+    // is no extra gradient (dQ/dK/dV are evaluated at the biased P).
+
     CATLASS_DEVICE
     void SubGrapA(int64_t curIdx, int64_t curS1Idx, int64_t curS2Idx, DBParams& dbParam,
                                 event_t mte2WaitMte3A)
@@ -664,6 +686,29 @@ public:
 
         AscendC::PipeBarrier<PIPE_V>();
         AscendC::Muls(vecClc2Buffer, vecClc2Buffer, (T2)scaleValue, s1ExtendSubGraph * s2ExtendAlign);
+
+        if constexpr (HAS_ALIBI) {
+            // Add ALiBi bias to S = scale·QK^T before the softmax recompute. This SubGrapA tile is a SINGLE
+            // head (head = n2Idx*g + gIdx): under BNS with qNBlockSize=1, head=absRow/qSBlockSize=0 and
+            // token=absRow%qSBlockSize=absRow, so we pass qSBlockSize = s1ExtendSubGraph (the chunk's rows)
+            // and absRowStart=0. We use the general -slope·|i_q - j| form, which is correct for BOTH causal
+            // and non-causal: in the causal region (i>=j) |i-j|=i-j, so it equals the causal-optimized
+            // slope·j up to a per-row constant (-slope·i) that softmax drops -> the recomputed P matches
+            // forward (up to fp32 rounding, well within the existing fwd/bwd recompute tolerance).
+            const int64_t slopeOffset =
+                dbParam.bIdx * alibiSlopesBatchStride + dbParam.n2Idx * static_cast<int64_t>(g) + dbParam.gIdx;
+            int64_t alibiDiffS = static_cast<int64_t>(dbParam.actualS2Len) - static_cast<int64_t>(dbParam.actualS1Len);
+            alibiDiffS = (alibiDiffS < 0) ? 0 : alibiDiffS;
+            const int64_t alibiQPosBase = alibiDiffS +
+                static_cast<int64_t>(dbParam.s1oIdx * s1CvInner + curS1Idx * s1VecSize);
+            LocalTensor<float> bwdWorkUb =
+                unifiedBuffer.GetWithOffset<float>(s2ExtendAlign, ALIBI_BWD_WORK_UB_OFFSET);
+            Alibi::ApplyAlibiRows<Alibi::AlibiMaskType::NO_MASK>(vecClc2Buffer, 0, s2ExtendAlign, s2ExtendAlign,
+                0, s1ExtendSubGraph, s1ExtendSubGraph, alibiQPosBase,
+                alibiSlopesGm, slopeOffset, bwdWorkUb,
+                static_cast<int64_t>(s2VBegin));
+            AscendC::PipeBarrier<PIPE_V>();
+        }
 
         ///////////////////////////////////////////////////////////////
         // attenMask
@@ -985,16 +1030,18 @@ public:
 template <
     class ElementVecDtype,
     InputLayout inputLayout,
-    class TilingData>
+    class TilingData,
+    bool HAS_ALIBI_>
 class BlockEpilogue<
-    EpilogueAtlasA2FAGOp,
+    EpilogueAtlasA2FAGOp<HAS_ALIBI_>,
     ElementVecDtype,
     std::integral_constant<InputLayout, inputLayout>,
     TilingData>
 {
 public:
-    using DispatchPolicy = EpilogueAtlasA2FAGOp;
+    using DispatchPolicy = EpilogueAtlasA2FAGOp<HAS_ALIBI_>;
     using ArchTag = typename DispatchPolicy::ArchTag;
+    static constexpr bool HAS_ALIBI = HAS_ALIBI_;
 
     static constexpr InputLayout getLayout()
     {
@@ -1009,6 +1056,7 @@ public:
     GlobalTensor<ElementVecDtype> dropWorkSpaceGm, mulWorkSpaceGm;
     GlobalTensor<float> rowLseGm;
     GlobalTensor<float> sfmgWorkspaceGm;
+    GlobalTensor<float> alibiSlopesGm;   // [b, n2*g] broadcast slopes; bound from tiling in init()
 
     constexpr static uint32_t DTYPE_FACTOR = sizeof(float) / sizeof(ElementVecDtype);
     constexpr static uint32_t cal_block_num = 32 / sizeof(float);
@@ -1035,6 +1083,11 @@ public:
 
     constexpr static  uint32_t AttenMaskDimS2 = 2048;
 
+    // ALiBi bwd scratch offset: a one-row work buffer (<= s2ExtendAlign, <= 256 floats). Placed in the free UB
+    // gap (107K–148K, after DbBegin region). [需 NPU 验证] These offsets must be free in the UB layout;
+    // DbBegin=74K, simpleSoftmaxResBuf uses 33K → ends at 107K. Slopes are now read directly from GM.
+    constexpr static uint32_t ALIBI_BWD_WORK_UB_OFFSET = 110 * 1024;
+
     uint32_t blockIdx;
     uint32_t cubeBlockIdx;
     uint32_t subIdx;
@@ -1054,6 +1107,8 @@ public:
     int64_t t1;
 
     float scaleValue;
+
+    int64_t alibiSlopesBatchStride = 0;  // batch stride for slopes; 0 for [nheads], stride(0) for [b,nheads]
 
     int32_t cubeBaseMN;
 
@@ -1087,8 +1142,9 @@ public:
     CATLASS_DEVICE
     BlockEpilogue(Arch::Resource<ArchTag> &resource, AscendC::TPipe *pipe_in, __gm__ uint8_t *row_lse,
     __gm__ uint8_t *atten_mask, __gm__ uint8_t *cu_seq_qlen,
-    __gm__ uint8_t *cu_seq_kvlen, __gm__ uint8_t * workspace, int32_t batchIn, __gm__ uint8_t * tiling_in)
+    __gm__ uint8_t *cu_seq_kvlen, __gm__ uint8_t *alibi_slopes, __gm__ uint8_t * workspace, int32_t batchIn, __gm__ uint8_t * tiling_in)
     {
+        alibiSlopesGm.SetGlobalBuffer((__gm__ float *)alibi_slopes);
         b = batchIn;
         pipe = pipe_in;
 
@@ -1119,6 +1175,9 @@ public:
         int64_t dsWorkSpaceOffset = tilingData->dsWorkSpaceOffset;
 
         scaleValue = tilingData->scaleValue;
+        // ALiBi: slopes GM pointer arrives as an independent kernel arg (bound in the ctor body);
+        // only the batch stride is routed through tiling. ALiBi is compiled in/out by HAS_ALIBI.
+        alibiSlopesBatchStride = tilingData->alibiSlopesBatchStride;
         softmaxTilingData.srcM = tilingData->softmaxTilingData.srcM;
         softmaxTilingData.srcK = tilingData->softmaxTilingData.srcK;
         softmaxTilingData.srcSize = tilingData->softmaxTilingData.srcSize;
@@ -1288,6 +1347,36 @@ public:
 
         AscendC::PipeBarrier<PIPE_V>();
         AscendC::Muls(vecClc2Buffer, vecClc2Buffer, scaleValue, s1Extend * s2ExtendAlign);
+
+        ///////////////////////////////////////////////////////////////
+        // ALiBi: add -slope·|i-j| bias to S before softmax recompute. Mirrors the general
+        // bwd (SameAbVec) logic: alibiDiffS = max(0, actualS2Len - actualS1Len) for prefix/cross-
+        // attention; alibiQPosBase = intra-sequence Q position (each sequence starts at 0).
+        // FIXME: KV tile start position (s2VBegin) uses blockInfo.SeqKIdx * S2_CUBESIZE — needs NPU
+        // verification that this is the correct KV start offset for varlen indexing.
+        ///////////////////////////////////////////////////////////////
+        if constexpr (HAS_ALIBI) {
+            const int64_t slopeOffset =
+                blockInfo.batchIdx * alibiSlopesBatchStride + blockInfo.nheadsKIdx * g + blockInfo.gIdx;
+            // Prefix/cross-attention offset: read actual Q/KV seqlens from cu_seq GM pointers for the current
+            // batch (blockInfo.batchIdx). For standard self-attention with equal Q/KV seqlens, this is 0.
+            int64_t actualS1Len = ((__gm__ int32_t *)cu_seq_qlen_addr)[blockInfo.batchIdx];
+            int64_t actualS2Len = ((__gm__ int32_t *)cu_seq_kvlen_addr)[blockInfo.batchIdx];
+            int64_t alibiDiffS = actualS2Len - actualS1Len;
+            alibiDiffS = (alibiDiffS < 0) ? 0 : alibiDiffS;
+            // Intra-sequence Q position of this tile's first row: SeqQIdx * S1_CUBESIZE + curSeqQIdx * s1VecSize.
+            const int64_t alibiQPosBase = alibiDiffS +
+                static_cast<int64_t>(blockInfo.SeqQIdx) * S1_CUBESIZE + curSeqQIdx * s1VecSize;
+            LocalTensor<float> bwdWorkUb =
+                unifiedBuffer.GetWithOffset<float>(s2ExtendAlign, ALIBI_BWD_WORK_UB_OFFSET);
+            // FIXME: Verify s2VStart is correct KV tile start for varlen (currently blockInfo.SeqKIdx * S2_CUBESIZE).
+            const int64_t s2VStart = static_cast<int64_t>(blockInfo.SeqKIdx) * S2_CUBESIZE;
+            Alibi::ApplyAlibiRows<Alibi::AlibiMaskType::NO_MASK>(vecClc2Buffer, 0, s2ExtendAlign, s2ExtendAlign,
+                0, s1Extend, s1Extend, alibiQPosBase,
+                alibiSlopesGm, slopeOffset, bwdWorkUb,
+                s2VStart);
+            AscendC::PipeBarrier<PIPE_V>();
+        }
 
         AscendC::PipeBarrier<PIPE_V>();
         LocalTensor<uint8_t> attenMaskUbuint8 =

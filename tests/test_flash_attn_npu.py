@@ -548,3 +548,330 @@ def test_fa_varlen_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_
     atol = 1e-2
     torch.testing.assert_close(output_npu.cpu(), golden_out.cpu(), rtol=rtol, atol=atol)
     torch.testing.assert_close(softmax_lse.cpu(), golden_lseL.cpu(), rtol=rtol, atol=atol)
+
+
+# ============ ALiBi Tests ============
+
+def generate_alibi_slopes(num_heads, batch_size=None, alibi_bias_max=8):
+    """
+    Generate ALiBi slopes following the official ALiBi implementation.
+
+    Args:
+        num_heads: number of attention heads
+        batch_size: if None, returns (nheads,) shared across batch;
+                   if int, returns (batch_size, nheads) per-batch slopes
+        alibi_bias_max: maximum ALiBi bias (default 8 from ALiBi paper)
+
+    Returns:
+        alibi_slopes: tensor of shape (nheads,) or (batch_size, nheads)
+    """
+    # ALiBi slope formula: slopes = -1 / (nheads / alibi_bias_max) ** (i + 1)
+    # where i in [0, nheads-1] for head index
+    x = (num_heads / alibi_bias_max) ** torch.arange(1, num_heads + 1, dtype=torch.float32)
+    slopes = 1.0 / x
+
+    if batch_size is not None:
+        # Broadcast to (batch_size, nheads) - all batches share the same slopes
+        slopes = slopes.unsqueeze(0).expand(batch_size, num_heads)
+
+    return slopes
+
+
+def ref_flash_attention_alibi(
+    query,
+    key,
+    value,
+    scale,
+    alibi_slopes,
+    is_causal,
+    data_type,
+    kv_seq_start=0,
+):
+    """
+    Reference flash attention implementation with ALiBi bias.
+
+    Args:
+        query: (q_seqlen, num_heads, head_size)
+        key: (kv_seqlen, num_heads_kv, head_size)
+        value: (kv_seqlen, num_heads_kv, head_size)
+        scale: scaling factor for attention scores
+        alibi_slopes: (num_heads,) or (1, num_heads) - ALiBi slopes per head
+        is_causal: whether to apply causal mask
+        data_type: output data type
+        kv_seq_start: starting position of key sequence (for causal ALiBi)
+
+    Returns:
+        output: (q_seqlen, num_heads, head_size)
+        lse: (num_heads, q_seqlen) log-sum-exp values
+    """
+    inner_prec = 0
+    interm_dtype = torch.float16 if inner_prec == 1 else torch.float32
+
+    query = query.to(torch.float32)
+    key = key.to(torch.float32)
+    value = value.to(torch.float32)
+
+    q_seqlen, num_heads, head_size = query.shape
+    kv_seqlen, num_heads_kv, _ = key.shape
+
+    # Handle GQA (grouped query attention) - replicate key/value across heads
+    group_num = num_heads // num_heads_kv
+    if group_num > 1:
+        key = key.repeat_interleave(group_num, dim=1)  # (kv_seqlen, num_heads, head_size)
+        value = value.repeat_interleave(group_num, dim=1)
+
+    # Compute QK^T
+    qk_result = torch.matmul(query, key.transpose(-2, -1))  # (num_heads, q_seqlen, kv_seqlen)
+    qk_result = qk_result.permute(1, 0, 2)  # (q_seqlen, num_heads, kv_seqlen)
+    qk_result = qk_result * scale
+
+    # Add ALiBi bias
+    if alibi_slopes is not None:
+        alibi_slopes = alibi_slopes.to(torch.float32)
+        if alibi_slopes.dim() == 1:
+            alibi_slopes = alibi_slopes.unsqueeze(0)  # (1, num_heads)
+
+        num_heads_slope = alibi_slopes.shape[1]
+        assert num_heads_slope == num_heads, f"alibi_slopes has {num_heads_slope} heads but query has {num_heads}"
+
+        # Reshape for broadcasting: (q_seqlen, kv_seqlen, 1, num_heads)
+        # Compute ALiBi bias per head and broadcast
+        alibi_bias = torch.zeros((q_seqlen, kv_seqlen, num_heads), dtype=torch.float32)
+
+        for h in range(num_heads):
+            slope = alibi_slopes[0, h].item()
+            for i in range(q_seqlen):
+                for j in range(kv_seqlen):
+                    # Absolute positions
+                    abs_q_pos = kv_seq_start + i
+                    abs_k_pos = kv_seq_start + j
+
+                    if is_causal:
+                        # Causal ALiBi: bias = slope * abs_k_pos (column-only, drops per-row constant)
+                        # But we need to ensure causality: only valid when i >= j (or abs_q_pos >= abs_k_pos)
+                        if abs_q_pos >= abs_k_pos:
+                            alibi_bias[i, j, h] = slope * abs_k_pos
+                        else:
+                            alibi_bias[i, j, h] = -1e10  # Mask out invalid positions
+                    else:
+                        # Non-causal ALiBi: bias = -slope * |i - j|
+                        # Absolute position difference: |(kv_seq_start + i) - (kv_seq_start + j)| = |i - j|
+                        alibi_bias[i, j, h] = -slope * abs(abs_q_pos - abs_k_pos)
+
+        # Add bias to qk_result
+        qk_result = qk_result + alibi_bias  # (q_seqlen, num_heads, kv_seqlen)
+
+    # Apply causal mask if needed (for causal ALiBi, we already masked in bias calculation)
+    if is_causal and alibi_slopes is None:
+        # Standard causal mask
+        causal_mask = torch.triu(torch.ones(q_seqlen, kv_seqlen), diagonal=kv_seqlen - q_seqlen + 1).bool()
+        qk_result = qk_result.masked_fill(causal_mask.unsqueeze(1), -1e10)
+
+    # Softmax
+    qk_result = qk_result.to(interm_dtype)
+    lm = torch.max(qk_result, dim=-1, keepdims=True)[0]
+    sim_sub = qk_result - lm
+    sim_sub = torch.exp(sim_sub.to(interm_dtype))
+    row_sum = torch.sum(sim_sub, dim=-1, keepdims=True)
+    p_result = sim_sub / row_sum
+    p_result = p_result.to(data_type)
+
+    # Compute output: P @ V
+    p_result = p_result.permute(1, 0, 2)  # (num_heads, q_seqlen, kv_seqlen)
+    output = torch.matmul(p_result, value.transpose(-2, -1))  # (num_heads, q_seqlen, head_size)
+    output = output.permute(1, 0, 2)  # (q_seqlen, num_heads, head_size)
+
+    # Compute LSE
+    lse = torch.squeeze(torch.log(row_sum) + lm, dim=-1).permute(1, 0)  # (num_heads, q_seqlen)
+
+    return output.to(data_type), lse
+
+
+# ALiBi test cases for flash_attn_with_kvcache (decode scenario)
+alibi_test_cases_kvcache = [
+    # (data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal, slopes_shape)
+    # Basic causal ALiBi tests
+    (torch.bfloat16, 1, 4, 4, 1, 1024, 128, 1, 128, True, None),      # decode, causal, shared slopes
+    (torch.bfloat16, 2, 8, 8, 1, 2048, 128, 1, 128, True, None),     # batch=2, causal, shared slopes
+    (torch.float16, 1, 16, 16, 1, 512, 64, 1, 128, True, None),       # smaller heads, causal
+
+    # Non-causal ALiBi tests
+    (torch.bfloat16, 1, 4, 4, 1, 1024, 128, 1, 128, False, None),     # decode, non-causal
+    (torch.bfloat16, 2, 8, 8, 1, 2048, 128, 1, 128, False, None),    # batch=2, non-causal
+
+    # GQA with ALiBi
+    (torch.bfloat16, 1, 32, 8, 1, 1024, 128, 1, 128, True, None),     # g=4, causal ALiBi
+    (torch.bfloat16, 2, 64, 16, 1, 2048, 128, 1, 128, False, None),   # g=4, non-causal
+
+    # Prefill (q_seqlen > 1) with ALiBi
+    (torch.bfloat16, 1, 4, 4, 16, 1024, 128, 0, 128, True, None),      # prefill, causal
+    (torch.bfloat16, 1, 8, 8, 32, 2048, 128, 0, 128, False, None),     # prefill, non-causal
+    (torch.float16, 2, 4, 4, 64, 512, 64, 0, 128, True, None),         # batch prefill, causal
+
+    # Multi-sequence tests
+    (torch.bfloat16, 4, 16, 16, 1, 4096, 128, 1, 128, True, None),    # multiple sequences, causal
+    (torch.bfloat16, 8, 32, 32, 1, 8192, 128, 1, 128, False, None),   # large batch, non-causal
+]
+
+@pytest.mark.parametrize("data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal, slopes_shape",
+                         alibi_test_cases_kvcache)
+def test_fa_kvcache_alibi(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal, slopes_shape):
+    """Test flash_attn_with_kvcache with ALiBi bias."""
+    q_min_range = -5.0
+    q_max_range = 5.0
+    kv_min_range = -5.0
+    kv_max_range = 5.0
+    num_blocks = 64
+
+    # Generate input data
+    query = (q_min_range + (q_max_range - q_min_range) * torch.rand(batch_size, q_seqlen, num_heads, head_size)).to(data_type).npu()
+
+    key_cache = (kv_min_range + (kv_max_range - kv_min_range) * torch.rand(num_blocks, block_size, kv_heads, head_size)).to(data_type).npu()
+    value_cache = (kv_min_range + (kv_max_range - kv_min_range) * torch.rand(num_blocks, block_size, kv_heads, head_size)).to(data_type).npu()
+
+    # Generate block tables
+    max_num_blocks_per_seq = (kv_seqlen + block_size - 1) // block_size
+    block_tables = []
+    for i in range(batch_size):
+        block_table = [max_num_blocks_per_seq * i + j for j in range(max_num_blocks_per_seq)]
+        block_tables.append(block_table)
+    block_tables = torch.tensor(block_tables, dtype=torch.int32).npu()
+
+    kv_seqlen_list = [kv_seqlen] * batch_size
+    kv_seqlen_list = torch.tensor(kv_seqlen_list, dtype=torch.int32).npu()
+
+    scale = 1.0 / (head_size ** 0.5)
+
+    # Generate ALiBi slopes
+    alibi_slopes = generate_alibi_slopes(num_heads, batch_size=None if slopes_shape is None else batch_size).to(data_type).npu()
+
+    # Call Flash Attention with ALiBi
+    out_npu, softmax_lse = flash_attn_with_kvcache(
+        query,
+        key_cache,
+        value_cache,
+        None,
+        None,
+        rotary_cos=None,
+        rotary_sin=None,
+        cache_seqlens=kv_seqlen_list,
+        cache_batch_idx=None,
+        cache_leftpad=None,
+        block_table=block_tables,
+        causal=is_causal,
+        window_size=[-1, -1],
+        rotary_interleaved=False,
+        alibi_slopes=alibi_slopes,
+        num_splits=0,
+        return_softmax_lse=True
+    )
+
+    # Compute reference output with ALiBi
+    golden_out = torch.empty((batch_size, q_seqlen, num_heads, head_size), dtype=data_type)
+    golden_lseL = torch.empty((batch_size, num_heads, q_seqlen), dtype=torch.float32)
+
+    key_cache_cpu = key_cache.detach().cpu()
+    value_cache_cpu = value_cache.detach().cpu()
+    block_tables_cpu = block_tables.cpu()
+
+    for i in range(batch_size):
+        # Reconstruct KV cache for this batch
+        keys = []
+        values = []
+        block_table = block_tables_cpu[i]
+
+        for j in range(kv_seqlen):
+            block_number = int(block_table[j // block_size])
+            block_offset = j % block_size
+            k = key_cache_cpu[block_number, block_offset, :, :]
+            k = k.reshape(kv_heads, head_size)
+            keys.append(k)
+            v = value_cache_cpu[block_number, block_offset, :, :]
+            v = v.reshape(kv_heads, head_size)
+            values.append(v)
+
+        key_cache_per_batch = torch.stack(keys, dim=0)  # (kv_seqlen, kv_heads, head_size)
+        value_cache_per_batch = torch.stack(values, dim=0)
+        query_cpu = query.detach().cpu()[i]  # (q_seqlen, num_heads, head_size)
+
+        # Call reference implementation with ALiBi
+        output, golden_lse = ref_flash_attention_alibi(
+            query_cpu, key_cache_per_batch, value_cache_per_batch,
+            scale, alibi_slopes.cpu(), is_causal, data_type, kv_seq_start=0
+        )
+
+        golden_out[i:i+1] = output.unsqueeze(0)
+        golden_lseL[i:i+1] = golden_lse.unsqueeze(0)
+
+    # Compare results (ALiBi can have larger numerical differences due to bias computation)
+    rtol = 2e-2  # Slightly relaxed tolerance for ALiBi
+    atol = 2e-2
+    torch.testing.assert_close(out_npu.cpu(), golden_out.cpu(), rtol=rtol, atol=atol)
+    torch.testing.assert_close(softmax_lse.cpu(), golden_lseL.cpu(), rtol=rtol, atol=atol)
+
+
+# ALiBi test cases for flash_attn_func (prefill scenario)
+alibi_test_cases_prefill = [
+    # (data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal)
+    (torch.bfloat16, 1, 4, 4, 128, 128, 128, True),
+    (torch.bfloat16, 2, 8, 8, 256, 256, 128, True),
+    (torch.float16, 1, 16, 16, 512, 512, 64, False),
+    (torch.bfloat16, 1, 32, 8, 1024, 1024, 128, True),    # GQA g=4
+    (torch.bfloat16, 2, 64, 16, 2048, 2048, 128, False),   # GQA g=4
+]
+
+@pytest.mark.parametrize("data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal",
+                         alibi_test_cases_prefill)
+def test_fa_prefill_alibi(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal):
+    """Test flash_attn_func (prefill) with ALiBi bias."""
+    q_min_range = -5.0
+    q_max_range = 5.0
+    kv_min_range = -5.0
+    kv_max_range = 5.0
+
+    # Generate input data
+    query = (q_min_range + (q_max_range - q_min_range) * torch.rand(batch_size, q_seqlen, num_heads, head_size)).to(data_type).npu()
+    key = (kv_min_range + (kv_max_range - kv_min_range) * torch.rand(batch_size, kv_seqlen, kv_heads, head_size)).to(data_type).npu()
+    value = (kv_min_range + (kv_max_range - kv_min_range) * torch.rand(batch_size, kv_seqlen, kv_heads, head_size)).to(data_type).npu()
+
+    scale = 1.0 / (head_size ** 0.5)
+
+    # Generate ALiBi slopes
+    alibi_slopes = generate_alibi_slopes(num_heads).to(data_type).npu()
+
+    # Call Flash Attention with ALiBi
+    out_npu = flash_attn_func(
+        query,
+        key,
+        value,
+        scale=scale,
+        causal=is_causal,
+        window_size=[-1, -1],
+        alibi_slopes=alibi_slopes,
+    )
+
+    # Compute reference output with ALiBi
+    golden_out = torch.empty((batch_size, q_seqlen, num_heads, head_size), dtype=data_type)
+
+    for i in range(batch_size):
+        query_cpu = query.detach().cpu()[i]
+        key_cpu = key.detach().cpu()[i]
+        value_cpu = value.detach().cpu()[i]
+
+        output, _ = ref_flash_attention_alibi(
+            query_cpu, key_cpu, value_cpu,
+            scale, alibi_slopes.cpu(), is_causal, data_type, kv_seq_start=0
+        )
+
+        golden_out[i:i+1] = output.unsqueeze(0)
+
+    # Compare results
+    rtol = 2e-2
+    atol = 2e-2
+    torch.testing.assert_close(out_npu.cpu(), golden_out.cpu(), rtol=rtol, atol=atol)
+
+
+if __name__ == "__main__":
+    # Run a quick test
+    print("Running ALiBi tests...")
+    pytest.main([__file__, "-k", "alibi", "-v", "-s"])

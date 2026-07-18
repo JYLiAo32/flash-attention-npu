@@ -87,6 +87,8 @@ struct FAGTilingData {
     // sfmg tiling data
     SoftMaxTiling softmaxTilingData;
     SoftMaxTiling softmaxGradTilingData;
+
+    int64_t alibiSlopesBatchStride = 0;
 };
 
 struct FAGv2TilingData {
@@ -94,6 +96,7 @@ struct FAGv2TilingData {
     int64_t dsWorkSpaceOffset;
     uint32_t coreNum;
     float scaleValue;
+    int64_t alibiSlopesBatchStride = 0;
     int64_t batch;
     int64_t t1;
     int64_t t2;
@@ -152,7 +155,8 @@ struct FAGKernelParams {
     GM_ADDR dq;
     GM_ADDR dk;
     GM_ADDR dv;
-    GM_ADDR alibi_slopes;
+    GM_ADDR alibiSlopes;
+
     GM_ADDR workspace;
     GM_ADDR tiling;
     // Methods
@@ -173,7 +177,7 @@ struct FAGKernelParams {
                     GM_ADDR dq_,
                     GM_ADDR dk_,
                     GM_ADDR dv_,
-                    GM_ADDR alibi_slopes_,
+                    GM_ADDR alibiSlopes_,
                     GM_ADDR workspace_,
                     GM_ADDR tiling_)
         : dout(dout_)
@@ -189,7 +193,7 @@ struct FAGKernelParams {
         , dq(dq_)
         , dk(dk_)
         , dv(dv_)
-        , alibi_slopes(alibi_slopes_)
+        , alibiSlopes(alibiSlopes_)
         , workspace(workspace_)
         , tiling(tiling_){
     }

@@ -96,6 +96,7 @@ namespace SplitFuse {
             AscendC::GlobalTensor<ElementP>& gP;
             AscendC::GlobalTensor<ElementOTmp>& gOTmp;
             AscendC::GlobalTensor<ElementOTmp>& gOUpdate;
+            AscendC::GlobalTensor<float>& gAlibiSlopes; 
         };
 
         __aicore__ inline
@@ -121,6 +122,7 @@ namespace SplitFuse {
             maskType = fATilingData->maskType;
             windowSizeLeft = fATilingData->windowSizeLeft;
             windowSizeRight = fATilingData->windowSizeRight;
+            alibiSlopesBatchStride = fATilingData->alibiSlopesBatchStride;
             scaleValue = fATilingData->scaleValue;
             maxQSeqlen = fATilingData->maxQSeqlen;
 
@@ -150,6 +152,8 @@ namespace SplitFuse {
             gO.SetGlobalBuffer((__gm__ ElementO *)params.o);
             AscendC::GlobalTensor<ElementLse> gLse;
             gLse.SetGlobalBuffer((__gm__ ElementLse *)params.lse);
+            AscendC::GlobalTensor<float> gAlibiSlopes;
+            gAlibiSlopes.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(params.alibiSlopes));
 
             AscendC::GlobalTensor<ElementLse> gLseFD;
             AscendC::GlobalTensor<ElementLse> gOFD;
@@ -173,7 +177,7 @@ namespace SplitFuse {
                 gQ, gK, gV, gMask, gBlockTable,
                 gActualQseqlen, gActualKvseqlen,
                 gO, gLse, gLseFD, gOFD,
-                gS, gP, gOTmp, gOUpdate
+                gS, gP, gOTmp, gOUpdate, gAlibiSlopes
             };
 
             uint32_t coreIdx = AscendC::GetBlockIdx();
@@ -230,9 +234,8 @@ namespace SplitFuse {
             AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID2);
             AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID3);
 
-            epilogueOnlineSoftmax.init(resource, scaleValue);
+            epilogueOnlineSoftmax.init(resource, scaleValue, gAlibiSlopes);
             epilogueRescaleO.init(resource);
-
             coreIdx = AscendC::GetBlockIdx() / AscendC::GetSubBlockNum();
 #endif
             strideQ = static_cast<uint64_t>(qHeads * embed);
@@ -338,7 +341,7 @@ namespace SplitFuse {
                         uint32_t curQNBlockTileTmp = GetQNBlockTile(qSeqlenTmp, groupSize);
                         uint32_t qNBlockNumPerGroupTmp = CeilDiv(groupSize, curQNBlockTileTmp);
                         uint32_t curQNBlockNumTmp = qNBlockNumPerGroupTmp * kvHeads;
-                        uint32_t curQSBlockTileTmp = GetQSBlockTile(kvSeqlenTmp);
+                        uint32_t curQSBlockTileTmp = GetQSBlockTile(kvSeqlenTmp); // 128
                         uint32_t curQSBlockNumTmp = CeilDiv(qSeqlenTmp, curQSBlockTileTmp);
                         curTotalTaskNumTmp += curQNBlockNumTmp * curQSBlockNumTmp;
                     }
@@ -357,9 +360,9 @@ namespace SplitFuse {
                     uint32_t qNBlockNumPerGroupCur = CeilDiv(groupSize, curQNBlockTileCur);
                     uint32_t curQNBlockNumCur = qNBlockNumPerGroupCur * kvHeads;
 
-                    uint32_t taskIdxCurBatch = taskIdx - preTotalTaskNumTmp;
-                    uint32_t qSBlockIdxCur = taskIdxCurBatch / curQNBlockNumCur;
-                    uint32_t qNBlockIdxCur = taskIdxCurBatch - qSBlockIdxCur * curQNBlockNumCur;
+                    uint32_t taskIdxCurBatch = taskIdx - preTotalTaskNumTmp; // 在当前batch中的任务索引
+                    uint32_t qSBlockIdxCur = taskIdxCurBatch / curQNBlockNumCur; // 当前任务的 S块索引
+                    uint32_t qNBlockIdxCur = taskIdxCurBatch - qSBlockIdxCur * curQNBlockNumCur; // 当前任务的 N块索引
 
                     runMainLoop(
                         coreIdx, curBatchTmp, qNBlockIdxCur, qSBlockIdxCur,
@@ -540,6 +543,17 @@ namespace SplitFuse {
             uint32_t qNBlockSize = (qNBlockIdxCurGroup == (qNBlockNumPerGroup - 1U)) ?
                 (groupSize - qNBlockIdxCurGroup * curQNBlockTile) : curQNBlockTile;
             uint32_t rowNum = qSBlockSize * qNBlockSize;
+#ifdef __DAV_C220_VEC__
+        // VEC-core only: ALiBi parameters are computed once per Q-tile and passed to all operator() calls.
+        // With the bottom-right alignment (kvSeqlen >= qSeqlen) query token t sits at abs pos diffS + t, so
+        // the tile's first token (qSBlockIdx*curQSBlockTile) is at diffS + qSBlockIdx*curQSBlockTile.
+        // slopesGmOffset = head qNStartIdx of this batch in the [b, nheads] broadcast slopes.
+            int64_t alibiDiffS = static_cast<int64_t>(kvSeqlen) - static_cast<int64_t>(qSeqlen);
+            alibiDiffS = (alibiDiffS < 0) ? 0 : alibiDiffS;
+            int64_t qKvSIdx = alibiDiffS + static_cast<int64_t>(qSBlockIdx * curQSBlockTile);
+            uint64_t alibiSlopesGmOffset =
+                static_cast<uint64_t>(BIdx) * static_cast<uint64_t>(alibiSlopesBatchStride) + qNStartIdx;  // 传入BIdx和QNStart合适
+#endif
 
             uint32_t noSkipKvS = kvSeqlen;
             uint32_t kvSLoopNumTotal = 0;
@@ -704,7 +718,9 @@ namespace SplitFuse {
                                     triDown,
                                     kvSStartIdx,
                                     kvSEndIdx,
-                                    isSplitKV);
+                                    isSplitKV,
+                                    qKvSIdx, 
+                                    alibiSlopesGmOffset);
                             } else {
                                 epilogueOnlineSoftmax(
                                     gP[gmOffsetP],
@@ -723,7 +739,9 @@ namespace SplitFuse {
                                     triDown,
                                     kvSStartIdx,
                                     kvSEndIdx,
-                                    false);
+                                    false,
+                                    qKvSIdx, 
+                                    alibiSlopesGmOffset);
                             }
                         } else {
                             uint32_t noMaskStackSeqNum = (triUp + 1) / MAX_KV_STACK_LEN;
@@ -740,9 +758,11 @@ namespace SplitFuse {
                                     (stackSeqCount == 0),
                                     (stackSeqCount == lastNoMaskStackId),
                                     qSBlockSize,
-                                    qNBlockSize, 
+                                    qNBlockSize,
                                     curStackTileMod,
-                                    isSplitKV);
+                                    isSplitKV, kvSStartIdx,
+                                    qKvSIdx, 
+                                    alibiSlopesGmOffset);
                             } else {
                                 epilogueOnlineSoftmax(
                                     gP[gmOffsetP],
@@ -753,9 +773,11 @@ namespace SplitFuse {
                                     (stackSeqCount == 0),
                                     (stackSeqCount == noMaskStackSeqNum - 1),
                                     qSBlockSize,
-                                    qNBlockSize, 
+                                    qNBlockSize,
                                     curStackTileMod,
-                                    false);
+                                    false, kvSStartIdx,
+                                    qKvSIdx, 
+                                    alibiSlopesGmOffset);
                             }
                         }
                     } else if constexpr (MASK_TYPE == FaiKenel::MaskType::MASK_SWA) {
@@ -790,7 +812,9 @@ namespace SplitFuse {
                                     windowSizeLeftStartLen,
                                     windowSizeLeftEndLen,
                                     windowSizeRightStartLen,
-                                    windowSizeRightEndLen);
+                                    windowSizeRightEndLen,
+                                    qKvSIdx, 
+                                    alibiSlopesGmOffset);
                         } else {
                             bool isLastNoMaskStackTile = (windowSizeRightStartLen >= kvSeqlen) || (windowSizeRightStartLen < 0);
                             uint32_t kvSeqlenLimit = isLastNoMaskStackTile ? kvSeqlen : windowSizeRightStartLen;
@@ -810,7 +834,9 @@ namespace SplitFuse {
                                 curStackTileMod,
                                 false,
                                 startsWithMaskTile,
-                                startsWithMaskThenNomaskFlag);
+                                startsWithMaskThenNomaskFlag, kvSStartIdx,
+                                qKvSIdx, 
+                                alibiSlopesGmOffset);
                             startsWithMaskTile = false;
                         }
                     } else {
@@ -825,9 +851,11 @@ namespace SplitFuse {
                                 (stackSeqCount == 0),
                                 0,
                                 qSBlockSize,
-                                qNBlockSize, 
+                                qNBlockSize,
                                 curStackTileMod,
-                                isSplitKV);
+                                isSplitKV, kvSStartIdx,
+                                qKvSIdx, 
+                                alibiSlopesGmOffset);
                         } else {
                             epilogueOnlineSoftmax(
                                 gP[gmOffsetP],
@@ -840,7 +868,9 @@ namespace SplitFuse {
                                 qSBlockSize,
                                 qNBlockSize,
                                 curStackTileMod,
-                                false);
+                                false, kvSStartIdx,
+                                qKvSIdx, 
+                                alibiSlopesGmOffset);
                         }
                     }
                     Arch::CrossCoreSetFlag<0x2, PIPE_MTE3>(softmaxReady);
@@ -985,6 +1015,7 @@ namespace SplitFuse {
         int64_t  windowSizeRight;
         float    scaleValue;
         uint32_t totalQTokens;
+        int64_t  alibiSlopesBatchStride;
         uint32_t maxQSeqlen;
 
         uint64_t strideQ;
@@ -1016,7 +1047,8 @@ namespace SplitFuse {
         FaiKenel::MaskType maskCategory = FaiKenel::MaskType::NO_MASK,
         FaiKenel::inputLayout inLayout = FaiKenel::inputLayout::TND,
         Epilogue::LseModeT lseMode = Epilogue::LseModeT::NONE,
-        bool IS_FD = false>
+        bool IS_FD = false,
+        bool HAS_ALIBI = false>
     __global__ __aicore__ void FAInfer(
         uint64_t fftsAddr,
         GM_ADDR q,
@@ -1029,7 +1061,8 @@ namespace SplitFuse {
         GM_ADDR actualQseqlen,
         GM_ADDR actualKvseqlen,
         GM_ADDR workspace,
-        GM_ADDR tiling)
+        GM_ADDR tiling,
+        GM_ADDR alibiSlopes)
     {
         AscendC::SetSyncBaseAddr(fftsAddr);
 
@@ -1064,7 +1097,7 @@ namespace SplitFuse {
         using BlockMmadQK = Gemm::Block::BlockMmad<DispatchPolicyQK, L1TileShapeQK, L0TileShapeQK,
                                                    QType, KType, SType>;
 
-        using DispatchPolicyOnlineSoftmax = Epilogue::EpilogueAtlasA2OnlineSoftmaxT<lseMode, IntermCalcPrec>;
+        using DispatchPolicyOnlineSoftmax = Epilogue::EpilogueAtlasA2OnlineSoftmaxT<lseMode, IntermCalcPrec, HAS_ALIBI>;
         using PType = Gemm::GemmType<ElementP, LayoutP>;
         using maskType = Gemm::GemmType<ElementMask, LayoutMask>;
         using EpilogueOnlineSoftmax =
@@ -1095,7 +1128,7 @@ namespace SplitFuse {
             FAInferKernel<BlockMmadQK, BlockMmadPV, EpilogueOnlineSoftmax, EpilogueRescaleO,
                           PagedCacheFlag, maskCategory, inLayout>>;
 
-        FAIKernelParams params{q, k, v, mask, blockTables, actualQseqlen, actualKvseqlen, o, lse, workspace, tiling};
+        FAIKernelParams params{q, k, v, mask, blockTables, actualQseqlen, actualKvseqlen, o, lse, workspace, tiling, alibiSlopes};
         FAInferKernelType flashAttnInfer;
         flashAttnInfer(params);
     }

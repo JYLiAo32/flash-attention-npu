@@ -35,6 +35,8 @@ struct FwdLaunchArgs {
     bool is_causal;
     bool is_local;              // sliding-window attention (MASK_SWA)
     bool flashDecodeFlag;       // only meaningful for the BSND (kvcache) path
+    // bool has_alibi = false;
+    uint8_t *alibiSlopesDevice;  // may be nullptr when alibi is unused
     uint8_t *qDevice;
     uint8_t *kDevice;
     uint8_t *vDevice;
@@ -46,7 +48,7 @@ struct FwdLaunchArgs {
     uint8_t *kvSeqDevice;
     uint8_t *workspaceDevice;
     uint8_t *tilingDevice;
-};
+    };
 
 // Per-(dtype, layout) implementation, defined in autogen/fwd_dispatch_<dtype>_<layout>.cpp.
 // Each TU instantiates one launch_fwd_impl<DType, IS_TND> (BSND: 6 FAInfer variants,
