@@ -1,0 +1,953 @@
+# Copyright (c) 2026, Minghua Shen.
+
+import sys
+import os
+import torch
+import torch_npu
+import pytest
+from flash_attn_npu_v2 import flash_attn_with_kvcache, flash_attn_func, flash_attn_varlen_func
+
+def group_matmul(head, kv_head, left, right, high_prec = 1):
+    group_num = head // kv_head
+    score = None
+    for i in range(kv_head):
+        if high_prec == 0:
+            group_score = torch.matmul(left[i * group_num:(i + 1) * group_num, :, :].to(torch.float32),
+                                        right[i:(i + 1), :, :].to(torch.float32)).to(torch.float32)
+        else:
+            group_score = torch.matmul(left[i * group_num:(i + 1) * group_num, :, :].to(torch.float32),
+                                        right[i:(i + 1), :, :].to(torch.float32))
+        if score is None:
+            score = group_score
+        else:
+            score = torch.cat((score, group_score), 0)
+    return score
+
+def softmax1(
+    qk_result,
+    is_first,
+    gm,
+    interm_dtype = torch.float16
+    ):
+    sim = qk_result.to(interm_dtype)
+    lm = torch.max(sim, dim=-1, keepdims=True)[0]
+    if is_first:
+        hm = lm
+        dm = 0
+    else:
+        hm = torch.maximum(gm, lm)
+        dm = gm - hm
+    gm = hm
+    sim_sub = sim - hm
+    sim_sub = torch.exp(sim_sub.to(interm_dtype))
+    row_sum = torch.sum(sim_sub, dim=-1, keepdims=True)
+    return sim_sub, row_sum, dm, gm
+
+def qkMM1(
+    query,
+    key
+    ):
+    result = None
+    qk_k = key.shape[1]
+    qk_k_split = 128
+    qk_k_loop = (qk_k + 127) // 128
+    for qk_k_loop_idx in range(qk_k_loop):
+        sub_k = 128 if qk_k_loop_idx != (qk_k_loop - 1) else (qk_k - qk_k_loop_idx * 128)
+        partial_Query = query[:, :, qk_k_loop_idx * 128: qk_k_loop_idx * 128 + sub_k]
+        partial_Key = key[:, qk_k_loop_idx * 128: qk_k_loop_idx * 128 + sub_k, :]
+        result_split = group_matmul(partial_Query.shape[0], partial_Key.shape[0], partial_Query, partial_Key, 0)
+        if result is None:
+            result = result_split
+        else:
+            result = result + result_split
+    return result
+
+def pvMM2(
+    p,
+    value
+    ):
+    result = None
+    pv_k = value.shape[1]
+    pv_k_split = 128
+    pv_k_loop = (pv_k + 127) // 128
+    for pv_k_loop_idx in range(pv_k_loop):
+        sub_k = 128 if pv_k_loop_idx != (pv_k_loop - 1) else (pv_k - pv_k_loop_idx * 128)
+        partial_P = p[:, :, pv_k_loop_idx * 128: pv_k_loop_idx * 128 + sub_k]
+        partial_Value = value[:, pv_k_loop_idx * 128: pv_k_loop_idx * 128 + sub_k, :]
+        result_split = group_matmul(partial_P.shape[0], partial_Value.shape[0], partial_P, partial_Value, 0)
+        if result is None:
+            result = result_split
+        else:
+            result = result + result_split
+    return result
+
+def ref_flash_attention(
+    query,
+    key,
+    value,
+    scale,
+    mask,
+    data_type,
+    softcap,
+    ):
+    inner_prec = 0
+    interm_dtype = torch.float16 if inner_prec == 1 else torch.float32
+    query = query.permute(1, 0, 2)
+    key = key.permute(1, 2, 0)
+    value = value.permute(1, 0, 2)
+    scale = torch.tensor(scale)
+    scale = scale.to(torch.float16) if inner_prec == 1 else scale.to(torch.float32)
+    context_len = key.shape[2]
+    context_size = 512
+    group_num = query.shape[0] // key.shape[0]
+    gl = None
+    gl_high = None
+    go = None
+    go_high = None
+    if mask is not None:
+        mask = mask.cpu()
+    for kv_start in range(0, context_len, context_size):
+        sub_len = context_size
+        if kv_start + context_size > context_len:
+            sub_len = context_len - kv_start
+        sub_key = key[:, :, kv_start: kv_start + sub_len]
+        sub_mask = None
+        if mask is not None:
+            sub_mask = mask[:query.shape[1], kv_start : kv_start + sub_len].to(interm_dtype) * (-1e4)
+        sub_value = value[:, kv_start: kv_start + sub_len, :]
+        qk_result = qkMM1(query, sub_key).to(interm_dtype)
+        qk_result = qk_result * scale
+        if softcap > 0.0:
+            qk_result = softcap * torch.tanh(qk_result / softcap)
+        if mask is not None:
+            qk_result += sub_mask
+        if kv_start == 0:
+            gm = None
+        p_result, row_sum, dm, gm = softmax1(qk_result, kv_start == 0, gm, interm_dtype)
+        p_result = p_result.to(data_type)
+        if kv_start == 0:
+            gm_high = None
+        lo = pvMM2(p_result, sub_value).to(interm_dtype)
+        if kv_start == 0:
+            gl = row_sum
+            go = lo
+        else:
+            dm = torch.exp(dm)
+            gl = gl * dm
+            gl = gl + row_sum
+            go = go * dm
+            go = go + lo
+    go = go / gl
+    go = go.permute(1, 0, 2)
+    lse = torch.squeeze((torch.log(gl) + gm), dim=-1).to(torch.float32)
+    return go.to(data_type), lse
+
+test_cases = [
+    # (data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal, window_size_left, window_size_right, softcap)
+    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, 1, 128, False, -1, -1, 0.0),
+    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, 0, 128, True, -1, -1, 0.0),
+    (torch.float16, 7, 1, 1, 512, 512, 128, 1, 128, False, -1, -1, 0.0),
+    (torch.bfloat16, 1, 1, 1, 1, 1024, 128, 1, 128, True, -1, -1, 0.0),
+    (torch.bfloat16, 1, 1, 1, 1, 1024, 128, 1, 128, False, -1, -1, 0.0),
+    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, 1, 128, False, -1, -1, 0.0),
+    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, 1, 128, True, -1, -1, 0.0),
+    (torch.float16, 7, 1, 1, 512, 512, 128, 1, 128, False, -1, -1, 0.0),
+    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, 1, 128, False, -1, -1, 0.0),
+    (torch.bfloat16, 2, 1, 1, 1024, 1024, 128, 1, 128, False, -1, -1, 0.0),
+    (torch.bfloat16, 2, 1, 1, 1024, 1024, 128, 1, 128, False, -1, -1, 0.0),
+    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, 1, 128, True, -1, -1, 0.0),
+    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, 1, 128, True, -1, -1, 0.0),
+    (torch.bfloat16, 1, 1, 1, 1, 1024, 128, 1, 128, True, -1, -1, 0.0),
+    (torch.bfloat16, 1, 1, 1, 1, 1024, 128, 1, 128, False, -1, -1, 0.0),
+    (torch.bfloat16, 1, 1, 1, 1, 1024, 128, 1, 128, True, -1, -1, 0.0),
+    (torch.bfloat16, 1, 1, 1, 1, 1024, 128, 1, 128, False, -1, -1, 0.0),
+    # kv=4096 -> 8 S2 blocks: num_splits=2 -> 2 segs (4 blk each), num_splits=4 -> 4 segs (2 blk each).
+    (torch.bfloat16, 1, 1, 1, 1, 4096, 128, 1, 128, False, -1, -1, 0.0),
+    (torch.bfloat16, 2, 1, 1, 1, 2048, 128, 1, 128, False, -1, -1, 0.0),
+    (torch.float16, 2, 2, 1, 128, 128, 128, 1, 128, True, -1, -1, 0.0),
+    (torch.bfloat16, 2, 6, 2, 2, 1024, 128, 1, 128, True, -1, -1, 0.0),
+    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, 1, 128, True, 512, 0, 0.0),  # Mistral-style causal SWA
+    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, 1, 128, True, 512, 256, 0.0),
+    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, 0, 128, True, -128, 864, 0.0),
+    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, 1, 128, False, 0, 256, 0.0),
+    (torch.float16, 2, 2, 2, 512, 512, 128, 0, 128, False, 64, 128, 0.0),
+
+    (torch.bfloat16, 1, 8, 2, 1, 512, 128, 0, 128, True, -1, -1, 0.0),
+    (torch.bfloat16, 4, 32, 8, 1, 2048, 128, 0, 128, False, -1, -1, 0.0), # g=4,decode, qNBlockTile=4
+    (torch.bfloat16, 8, 64, 8, 1, 4096, 128, 0, 128, False, -1, -1, 0.0), # g=8,decode, qNBlockTile=8
+    (torch.bfloat16, 4, 64, 16, 16, 1024, 128, 0, 128, True, -1, -1, 0.0),# g=4,Sq=16,qNBlockTile=4
+    (torch.bfloat16, 8, 128, 16, 32, 2048, 128, 0, 128, False, -1, -1, 0.0),# g=8,Sq=32,qNBlockTile=4
+    (torch.bfloat16, 4, 64, 8, 64, 4096, 128, 0, 128, False, -1, -1, 0.0),# g=8,Sq=64,qNBlockTile=2
+    (torch.bfloat16, 8, 128, 8, 1, 4096, 128, 0, 128, False, -1, -1, 0.0),# g=16, decode, qNBlockTile=16
+    (torch.bfloat16, 4, 32, 4, 16, 1024, 256, 0, 128, False, -1, -1, 0.0),# g=8,Sq=16,D=256
+    (torch.bfloat16, 8, 128, 32, 64, 2048, 128, 0, 128, True, -1, -1, 0.0), # g=4,Sq=64,qNBlockTile=2
+    (torch.bfloat16, 4, 64, 4, 32, 512, 128, 0, 128, False, -1, -1, 0.0), # g=16, Sq=32,qNBlockTile=4
+    (torch.bfloat16, 2, 64, 8, 1, 4096, 256, 0, 128, False, -1, -1, 0.0), # g=8,decode, D=256
+    (torch.bfloat16, 1, 32, 4, 1, 2048, 128, 1, 128, False, -1, -1, 0.0), # FD decode, g=8,nT=4
+    (torch.bfloat16, 1, 64, 4, 1, 4096, 128, 1, 128, False, -1, -1, 0.0), # FD decode, g=16, nT=4
+    (torch.bfloat16, 1, 128, 4, 1, 2048, 128, 1, 128, True, -1, -1, 0.0), # FD decode, g=32, nT=4
+    (torch.bfloat16, 2, 32, 4, 1, 4096, 128, 1, 128, False, -1, -1, 0.0), # FD decode, g=8,nT=8
+    (torch.bfloat16, 2, 16, 2, 1, 2048, 128, 1, 128, True, -1, -1, 0.0),# FD decode, g=8,nT=4
+    (torch.bfloat16, 1, 32, 8, 1, 2048, 256, 1, 128, False, -1, -1, 0.0), # FD decode, g=4,nT=8, D=256
+    (torch.bfloat16, 1, 32, 4, 4, 2048, 128, 1, 128, False, -1, -1, 0.0), # FD multi, g=8,Sq*g=32,nT=4
+    (torch.bfloat16, 2, 16, 2, 4, 4096, 128, 1, 128, False, -1, -1, 0.0), # FD multi, g=8,Sq*g=32,nT=4
+    (torch.bfloat16, 1, 64, 4, 8, 2048, 128, 1, 128, True, -1, -1, 0.0),# FD multi, g=16, Sq*g=128, nT=4
+    (torch.bfloat16, 1, 32, 4, 16, 4096, 128, 1, 128, False, -1, -1, 0.0),# FD multi, g=8,Sq*g=128, nT=4
+    
+    (torch.bfloat16, 1, 32, 4, 3, 2048, 128, 1, 128, False, -1, -1, 0.0), # FD JSQ4 Sq=3,g=8,nT=4  [非2幂]
+    (torch.bfloat16, 2, 16, 2, 5, 4096, 128, 1, 128, True, -1, -1, 0.0),# FD JSQ4 Sq=5,g=8,nT=4  [非2幂]
+    (torch.bfloat16, 1, 64, 4, 7, 2048, 128, 1, 128, False, -1, -1, 0.0), # FD JSQ4 Sq=7,g=16, nT=4  [非2幂]
+    (torch.bfloat16, 1, 32, 4, 11, 4096, 128, 1, 128, False, -1, -1, 0.0),# FD JSQ4 Sq=11, g=8,nT=4  [非2幂]
+    (torch.bfloat16, 1, 32, 8, 13, 2048, 256, 1, 128, False, -1, -1, 0.0),# FD JSQ4 Sq=13, g=4,nT=8, D=256 [非2幂]
+    (torch.bfloat16, 2, 16, 2, 15, 2048, 128, 1, 128, True, -1, -1, 0.0), # FD JSQ4 Sq=15, g=8,nT=4  [非2幂]
+    (torch.bfloat16, 4, 32, 32, 1, 2048, 128, 0, 128, False, -1, -1, 0.0),
+    (torch.bfloat16, 8, 64, 64, 1, 4096, 128, 0, 128, False, -1, -1, 0.0),
+    (torch.bfloat16, 4, 32, 32, 16, 1024, 128, 0, 128, True, -1, -1, 0.0),
+    (torch.bfloat16, 4, 64, 64, 32, 2048, 128, 0, 128, False, -1, -1, 0.0),
+    (torch.bfloat16, 8, 16, 16, 8, 4096, 128, 0, 128, False, -1, -1, 0.0),
+    (torch.bfloat16, 2, 32, 32, 1, 4096, 256, 0, 128, False, -1, -1, 0.0),
+    (torch.bfloat16, 2, 32, 8, 65, 2048, 128, 0, 128, False, -1, -1, 0.0),
+    (torch.bfloat16, 2, 64, 16, 96, 2048, 128, 0, 128, False, -1, -1, 0.0),
+    (torch.bfloat16, 1, 32, 8, 128, 4096, 128, 0, 128, False, -1, -1, 0.0),
+    (torch.bfloat16, 2, 16, 4, 256, 2048, 128, 0, 128, True, -1, -1, 0.0),
+    (torch.bfloat16, 1, 32, 4, 65, 2048, 256, 0, 128, False, -1, -1, 0.0),
+    (torch.bfloat16, 2, 24, 2, 6, 2048, 128, 0, 128, False, -1, -1, 0.0),
+    (torch.bfloat16, 4, 32, 2, 6, 4096, 128, 0, 128, False, -1, -1, 0.0),
+    (torch.bfloat16, 2, 40, 2, 6, 2048, 128, 0, 128, False, -1, -1, 0.0),
+    (torch.bfloat16, 2, 24, 2, 8, 2048, 128, 0, 128, False, -1, -1, 0.0),
+    (torch.bfloat16, 4, 32, 2, 8, 4096, 128, 0, 128, False, -1, -1, 0.0),
+    (torch.bfloat16, 2, 24, 2, 10, 2048, 128, 0, 128, False, -1, -1, 0.0),
+    (torch.bfloat16, 4, 32, 2, 10, 4096, 128, 0, 128, False, -1, -1, 0.0),
+    (torch.bfloat16, 2, 64, 2, 10, 2048, 128, 0, 128, False, -1, -1, 0.0),
+    (torch.bfloat16, 2, 24, 2, 6, 2048, 256, 0, 128, False, -1, -1, 0.0),
+    (torch.bfloat16, 4, 48, 2, 8, 4096, 128, 0, 128, False, -1, -1, 0.0),
+    (torch.bfloat16, 2, 48, 4, 8, 2048, 128, 0, 128, False, -1, -1, 0.0),
+    (torch.bfloat16, 4, 64, 4, 10, 4096, 128, 0, 128, False, -1, -1, 0.0),
+    (torch.bfloat16, 1, 64, 4, 2, 2048, 128, 1, 128, False, -1, -1, 0.0),
+    (torch.bfloat16, 2, 32, 4, 2, 4096, 128, 1, 128, False, -1, -1, 0.0),
+    (torch.bfloat16, 1, 64, 8, 4, 4096, 128, 1, 128, True, -1, -1, 0.0),
+    (torch.bfloat16, 1, 32, 4, 7, 2048, 128, 1, 128, False, -1, -1, 0.0),
+    (torch.bfloat16, 2, 16, 2, 8, 4096, 128, 1, 128, False, -1, -1, 0.0),
+    (torch.bfloat16, 1, 32, 4, 13, 2048, 128, 1, 128, False, -1, -1, 0.0),
+    (torch.bfloat16, 1, 32, 8, 16, 2048, 256, 1, 128, False, -1, -1, 0.0),
+    # --- JSQ4/ODD ---
+    (torch.bfloat16, 1, 6, 2, 6, 2048, 128, 1, 128, False, -1, -1, 0.0),
+    (torch.bfloat16, 1, 10, 2, 6, 2048, 128, 1, 128, False, -1, -1, 0.0),
+    (torch.bfloat16, 1, 6, 2, 10, 2048, 128, 1, 128, False, -1, -1, 0.0),
+    (torch.bfloat16, 1, 10, 2, 10, 2048, 128, 1, 128, False, -1, -1, 0.0),
+    (torch.bfloat16, 1, 14, 2, 10, 2048, 128, 1, 128, False, -1, -1, 0.0),
+    (torch.bfloat16, 1, 18, 2, 10, 2048, 128, 1, 128, False, -1, -1, 0.0),
+    (torch.bfloat16, 1, 6, 2, 14, 2048, 128, 1, 128, False, -1, -1, 0.0),
+    (torch.bfloat16, 1, 10, 2, 14, 2048, 128, 1, 128, False, -1, -1, 0.0),
+    (torch.bfloat16, 1, 6, 2, 9, 2048, 128, 1, 128, False, -1, -1, 0.0),
+    (torch.bfloat16, 1, 6, 2, 11, 2048, 128, 1, 128, False, -1, -1, 0.0),
+    (torch.bfloat16, 1, 10, 2, 15, 2048, 128, 1, 128, False, -1, -1, 0.0),
+    (torch.bfloat16, 1, 10, 2, 10, 4096, 256, 1, 128, True, -1, -1, 0.0),
+    (torch.bfloat16, 1, 8, 2, 8, 2048, 128, 1, 128, False, -1, -1, 0.0),
+    (torch.bfloat16, 1, 16, 2, 16, 2048, 128, 1, 128, False, -1, -1, 0.0),
+    # Softcap
+    (torch.bfloat16, 1, 32, 8, 128, 4096, 128, 0, 128, False, -1, -1, 30.0),
+    (torch.bfloat16, 2, 16, 4, 256, 2048, 128, 0, 128, True, -1, -1, 50.0),
+    (torch.bfloat16, 1, 32, 4, 65, 2048, 256, 0, 128, False, -1, -1, 50.0),
+    (torch.bfloat16, 2, 24, 2, 6, 2048, 128, 0, 128, False, -1, -1, 30.0),
+    (torch.bfloat16, 4, 32, 2, 6, 4096, 128, 0, 128, False, -1, -1, 50.0),
+    (torch.bfloat16, 2, 40, 2, 6, 2048, 128, 0, 128, False, -1, -1, 50.0),
+]
+
+@pytest.mark.parametrize("data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal, window_size_left, window_size_right, softcap", test_cases)
+def test_fa_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal, window_size_left, window_size_right, softcap):
+    q_min_range = -5.0
+    q_max_range = 5.0
+    kv_min_range = -5.0
+    kv_max_range = 5.0
+    block_size = 128
+    num_blocks = 64
+    query = (q_min_range + (q_max_range - q_min_range) * torch.rand(batch_size, q_seqlen, num_heads, head_size)).to(data_type).npu()
+    key_cache = None
+    value_cache = None
+    block_tables = []
+    if cache_mode == 1:
+        key_cache = (kv_min_range + (kv_max_range - kv_min_range) * torch.rand(num_blocks, block_size, kv_heads, head_size)).to(data_type).npu()
+        value_cache = (kv_min_range + (kv_max_range - kv_min_range) * torch.rand(num_blocks, block_size, kv_heads, head_size)).to(data_type).npu()
+        max_num_blocks_per_seq = (kv_seqlen + block_size - 1) // block_size
+        for i in range(batch_size):
+            block_table = [
+                max_num_blocks_per_seq * i + j
+                for j in range(max_num_blocks_per_seq)
+            ]
+            block_tables.append(block_table)
+        block_tables = torch.tensor(block_tables, dtype=torch.int32).npu()
+    else:
+        key_cache = (kv_min_range + (kv_max_range - kv_min_range) * torch.rand(batch_size, kv_seqlen, kv_heads, head_size)).to(data_type).npu()
+        value_cache = (kv_min_range + (kv_max_range - kv_min_range) * torch.rand(batch_size, kv_seqlen, kv_heads, head_size)).to(data_type).npu()
+        block_tables = None
+    kv_seqlen_list = [kv_seqlen] * batch_size
+    scale = 1.0 / (head_size ** 0.5)
+    is_rotary_interleaved = False
+    num_splits = 0
+    kv_seqlen_list = torch.tensor(kv_seqlen_list, dtype=torch.int32).npu()
+    rotary_cos = None
+    rotary_sin = None
+    cache_batch_idx = None
+    leftpad_k = None
+    alibi_slopes = None
+    window_size_left_golden = window_size_left
+    window_size_right_golden = window_size_right
+    if kv_seqlen > 0 and window_size_left_golden >= kv_seqlen - 1:
+        window_size_left_golden = -1
+    if q_seqlen > 0 and window_size_right_golden >= q_seqlen - 1:
+        window_size_right_golden = -1
+    if is_causal:
+        window_size_right_golden = 0
+    is_causal_golden = (window_size_left_golden < 0 and window_size_right_golden == 0)
+    is_local_golden = (window_size_left_golden >= 0 or window_size_right_golden > 0) and not is_causal_golden
+    sparse_mode = 4 if is_local_golden else 0
+
+    out_out, softmax_lse = flash_attn_with_kvcache(
+        query,
+        key_cache,
+        value_cache,
+        None,
+        None,
+        rotary_cos=rotary_cos,
+        rotary_sin=rotary_sin,
+        cache_seqlens=kv_seqlen_list,
+        cache_batch_idx=cache_batch_idx,
+        cache_leftpad=leftpad_k,
+        block_table=block_tables,
+        causal=is_causal,
+        window_size=[window_size_left, window_size_right],
+        softcap=softcap,
+        rotary_interleaved=is_rotary_interleaved,
+        alibi_slopes=alibi_slopes,
+        num_splits=num_splits,
+        return_softmax_lse=True
+    )
+    golden_out = torch.empty((batch_size, q_seqlen, num_heads, head_size), dtype=data_type)
+    golden_lseL = torch.empty((batch_size, num_heads, q_seqlen), dtype=torch.float32)
+    atten_mask = None
+
+    def create_binary_matrix(qSeqlen, kvSeqlen, preToken, nextToken):
+        preToken = kvSeqlen - qSeqlen - preToken
+        nextToken = kvSeqlen - qSeqlen + nextToken
+        matrix = [[0 for _ in range(kvSeqlen)] for _ in range(qSeqlen)]
+        for i in range(qSeqlen):
+            for j in range(kvSeqlen):
+                is_below_pretoken_line = (-i + j) < preToken
+                is_above_nexttoken_line = (-i + j) > nextToken
+                if is_below_pretoken_line or is_above_nexttoken_line:
+                    matrix[i][j] = 1
+        return torch.tensor(matrix, dtype=torch.bool)
+
+    if is_causal_golden:
+        atten_mask = torch.triu(
+            torch.ones(q_seqlen, kv_seqlen),
+            diagonal=kv_seqlen - q_seqlen + 1,
+        ).bool()
+    elif is_local_golden:
+        atten_mask = create_binary_matrix(q_seqlen, kv_seqlen, window_size_left_golden, window_size_right_golden)
+
+    for i in range(batch_size):
+        key_cache_per_batch = None
+        value_cache_per_batch = None
+        if cache_mode == 1:
+            keys = []
+            values = []
+            block_table = block_tables.cpu()[i]
+            # Hoist the D2H copy out of the per-token loop: indexing the CPU
+            # copy returns a *view*, and appending it to keys/values pins the
+            # whole copy alive. Doing .cpu() inside the loop pinned one full
+            # cache copy per token -> kv_seqlen * sizeof(cache) of host RAM.
+            key_cache_cpu = key_cache.detach().cpu()
+            value_cache_cpu = value_cache.detach().cpu()
+            for j in range(kv_seqlen):
+                block_number = int(block_table[j // block_size])
+                block_offset = j % block_size
+                k = key_cache_cpu[block_number, block_offset, :, :]
+                k = k.reshape(kv_heads, head_size)
+                keys.append(k)
+                v = value_cache_cpu[block_number, block_offset, :, :]
+                v = v.reshape(kv_heads, head_size)
+                values.append(v)
+            key_cache_per_batch = torch.stack(keys, dim=0)
+            value_cache_per_batch = torch.stack(values, dim=0)
+        else:
+            key_cache_per_batch = key_cache.detach().cpu()[i]
+            value_cache_per_batch = value_cache.detach().cpu()[i]
+        query_cpu = query.detach().cpu()[i]
+        if is_causal_golden or is_local_golden:
+            output, golden_lse = ref_flash_attention(query_cpu, key_cache_per_batch, value_cache_per_batch, scale, atten_mask, data_type, softcap)
+        else:
+            output, golden_lse = ref_flash_attention(query_cpu, key_cache_per_batch, value_cache_per_batch, scale, None, data_type, softcap)
+        out = output.reshape(q_seqlen, num_heads, head_size)
+        if is_local_golden:
+            preTokens = window_size_left_golden
+            nextTokens = window_size_right_golden
+            preTokensChange = preTokens - kv_seqlen + q_seqlen
+            nextTokensChange = nextTokens + kv_seqlen - q_seqlen
+            nextTokensError = -nextTokensChange if nextTokensChange < 0 else 0
+            preTokensError = (q_seqlen - kv_seqlen - preTokensChange) if q_seqlen > kv_seqlen + preTokensChange else 0
+            actualSeq = q_seqlen
+            actualSeq -= nextTokensError
+            actualSeq -= preTokensError
+            if actualSeq != q_seqlen:
+                if nextTokensError != 0:
+                    actualSeq = q_seqlen - actualSeq
+                    out[ :actualSeq, :, :] = 0
+                    golden_lse[:, :actualSeq] = torch.inf
+                elif preTokensError != 0:
+                    actualSeq = actualSeq
+                    out[actualSeq:, :, :] = 0
+                    golden_lse[:, actualSeq:] = torch.inf
+        golden_out[i:i+1] = out
+        golden_lseL[i:i+1] = golden_lse.reshape(num_heads, q_seqlen)
+    rtol = 1e-2
+    atol = 1e-2
+    torch.testing.assert_close(out_out.cpu(), golden_out.cpu(), rtol=rtol, atol=atol)
+    torch.testing.assert_close(softmax_lse.cpu(), golden_lseL.cpu(), rtol=rtol, atol=atol)
+
+
+test_cases = [
+    # (data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, return_attn_probs, is_causal, softcap)
+    (torch.float16, 1, 1, 1, 1024, 1024, 128, True, False, 0.0),
+    (torch.float16, 5, 4, 4, 1024, 1024, 128, True, True, 0.0),
+    (torch.float16, 7, 1, 1, 512, 512, 128, True, False, 0.0),
+    (torch.float16, 1, 1, 1, 1024, 1024, 128, False, False, 0.0),
+    (torch.float16, 5, 4, 4, 1024, 1024, 128, False, True, 0.0),
+    (torch.float16, 7, 1, 1, 512, 512, 128, False, False, 0.0),
+    (torch.float16, 4, 2, 1, 513, 513, 128, False, False, 0.0),
+    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, True, False, 0.0),
+    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, True, True, 0.0),
+    (torch.bfloat16, 7, 1, 1, 512, 512, 128, True, False, 0.0),
+    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, False, False, 0.0),
+    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, False, True, 0.0),
+    (torch.bfloat16, 7, 1, 1, 512, 512, 128, False, False, 0.0),
+    (torch.float16, 4, 2, 1, 513, 513, 128, False, False, 0.0),
+    # Softcap
+    (torch.float16, 7, 1, 1, 512, 512, 128, False, False, 30.0),
+    (torch.float16, 4, 2, 1, 513, 513, 128, False, False, 50.0),
+    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, True, False, 30.0),
+    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, True, True, 50.0),
+]
+@pytest.mark.parametrize("data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, return_attn_probs, is_causal, softcap", test_cases)
+def test_fa_fwd_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, return_attn_probs, is_causal, softcap):
+    q_min_range = -5.0
+    q_max_range = 5.0
+    kv_min_range = -5.0
+    kv_max_range = 5.0
+    num_blocks = 64
+    query = (q_min_range + (q_max_range - q_min_range) * torch.rand(batch_size, q_seqlen, num_heads, head_size)).to(data_type).npu()
+    key_cache = None
+    value_cache = None
+
+    key_cache = (kv_min_range + (kv_max_range - kv_min_range) * torch.rand(batch_size, kv_seqlen, kv_heads, head_size)).to(data_type).npu()
+    value_cache = (kv_min_range + (kv_max_range - kv_min_range) * torch.rand(batch_size, kv_seqlen, kv_heads, head_size)).to(data_type).npu()
+
+    scale = 1.0 / (head_size ** 0.5)
+    window_size_left = -1
+    window_size_right = -1
+    num_splits = 0
+    alibi_slopes = None
+
+    ret = flash_attn_func(
+        query,
+        key_cache,
+        value_cache,
+        0.0,
+        causal=is_causal,
+        window_size=[window_size_left,window_size_right],
+        softcap=softcap,
+        alibi_slopes=alibi_slopes,
+        return_attn_probs=return_attn_probs)
+    if not return_attn_probs:
+        out_out = ret
+    else:
+        out_out, softmax_lse, S_dmask = ret
+
+    golden_out = torch.empty((batch_size, q_seqlen, num_heads, head_size), dtype=data_type)
+    golden_lseL = torch.empty((batch_size, num_heads, q_seqlen), dtype=torch.float32)
+    atten_mask = None
+    if is_causal:
+        atten_mask = torch.triu(torch.ones(q_seqlen, kv_seqlen), diagonal=1).bool()
+    for i in range(batch_size):
+        key_cache_per_batch = None
+        value_cache_per_batch = None
+
+        key_cache_per_batch = key_cache.detach().cpu()[i]
+        value_cache_per_batch = value_cache.detach().cpu()[i]
+
+        query_cpu = query.detach().cpu()[i]
+        if is_causal:
+            output, golden_lse = ref_flash_attention(query_cpu, key_cache_per_batch, value_cache_per_batch, scale, atten_mask, data_type, softcap)
+        else:
+            output, golden_lse = ref_flash_attention(query_cpu, key_cache_per_batch, value_cache_per_batch, scale, None, data_type, softcap)
+        out = output.reshape(q_seqlen, num_heads, head_size)
+        golden_out[i:i+1] = out
+        golden_lseL[i:i+1] = golden_lse.reshape(num_heads, q_seqlen)
+    rtol = 1e-2
+    atol = 1e-2
+
+    torch.testing.assert_close(out_out.cpu(), golden_out.cpu(), rtol=rtol, atol=atol)
+    if return_attn_probs:
+        torch.testing.assert_close(softmax_lse.cpu(), golden_lseL.cpu(), rtol=rtol, atol=atol)
+
+test_cases = [
+    # (data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, window_size_left, window_size_right, softcap)
+    (torch.bfloat16, 1, 1, 1, 512, 1024, 128, True, -1, -1, 0.0),
+    (torch.bfloat16, 2, 4, 4, 1024, 1024, 128, False, -1, -1, 0.0),
+    (torch.float16, 7, 5, 1, 512, 512, 128, True, -1, -1, 0.0),
+    (torch.float16, 7, 5, 1, 777, 888, 192, False, -1, -1, 0.0),
+    (torch.float16, 7, 5, 1, 1777, 1888, 256, True, -1, -1, 0.0),
+    (torch.bfloat16, 1, 1, 1, 7777, 8192, 64, True, -1, -1, 0.0),
+    (torch.bfloat16, 7, 5, 1, 711, 8192, 111, True, -1, -1, 0.0),
+    # SWA
+    (torch.bfloat16, 1, 1, 1, 512, 512, 128, True, 512, 0, 0.0),
+    (torch.bfloat16, 1, 1, 1, 512, 512, 128, True, 256, 128, 0.0),
+    (torch.float16, 2, 4, 4, 256, 256, 128, False, 64, 128, 0.0),
+    (torch.bfloat16, 1, 1, 1, 512, 512, 128, False, 0, 256, 0.0),
+    (torch.bfloat16, 2, 6, 2, 128, 256, 128, True, 127, 0, 0.0),
+    (torch.bfloat16, 2, 4, 4, 128, 512, 128, True, 511, 0, 0.0),
+    (torch.float16, 1, 2, 2, 64, 192, 128, False, 32, 64, 0.0),
+    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, True, 512, 0, 0.0),
+    (torch.bfloat16, 1, 1, 1, 1, 1024, 128, True, 512, 0, 0.0),
+    (torch.float16, 2, 1, 1, 512, 512, 128, False, 508, -256, 0.0),
+    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, True, -128, 864, 0.0),
+    (torch.bfloat16, 2, 6, 2, 2, 1024, 128, True, 256, 0, 0.0),
+    # Softcap
+    (torch.float16, 7, 5, 1, 777, 888, 192, False, -1, -1,  30.0),
+    (torch.float16, 7, 5, 1, 1777, 1888, 256, True, -1, -1, 50.0),
+    (torch.bfloat16, 1, 1, 1, 7777, 8192, 64, True, -1, -1, 30.0),
+    (torch.bfloat16, 7, 5, 1, 711, 8192, 111, True, -1, -1, 50.0),
+]
+
+@pytest.mark.parametrize("data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, window_size_left, window_size_right, softcap", test_cases)
+def test_fa_varlen_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, window_size_left, window_size_right, softcap):
+    q_min_range = -5.0
+    q_max_range = 5.0
+    kv_min_range = -5.0
+    kv_max_range = 5.0
+    query = (q_min_range + (q_max_range - q_min_range) * torch.rand(batch_size * q_seqlen, num_heads, head_size)).to(data_type).npu()
+    key = (kv_min_range + (kv_max_range - kv_min_range) * torch.rand(batch_size * kv_seqlen, kv_heads, head_size)).to(data_type).npu()
+    value = (kv_min_range + (kv_max_range - kv_min_range) * torch.rand(batch_size * kv_seqlen, kv_heads, head_size)).to(data_type).npu()
+    actual_seq_len = torch.tensor([q_seqlen * i for i in range(batch_size + 1)], dtype=torch.int32).npu()
+    actual_kv_len = torch.tensor([kv_seqlen * i for i in range(batch_size + 1)], dtype=torch.int32).npu()
+
+    max_seqlen_q = q_seqlen
+    max_seqlen_k = kv_seqlen
+    dropout_p = 0.0
+    scale = 1.0 / (head_size ** 0.5)
+    alibi_slopes = None
+    deterministic = False
+    return_attn_probs = True
+    block_table = None
+
+    window_size_left_golden = window_size_left
+    window_size_right_golden = window_size_right
+    if kv_seqlen > 0 and window_size_left_golden >= kv_seqlen - 1:
+        window_size_left_golden = -1
+    if q_seqlen > 0 and window_size_right_golden >= q_seqlen - 1:
+        window_size_right_golden = -1
+    if is_causal:
+        window_size_right_golden = 0
+    is_causal_golden = (window_size_left_golden < 0 and window_size_right_golden == 0)
+    is_local_golden = (window_size_left_golden >= 0 or window_size_right_golden > 0) and not is_causal_golden
+
+    output_npu, softmax_lse, _ = flash_attn_varlen_func(
+        query,
+        key,
+        value,
+        actual_seq_len,
+        actual_kv_len,
+        max_seqlen_q,
+        max_seqlen_k,
+        dropout_p=dropout_p,
+        softmax_scale=scale,
+        causal=is_causal,
+        window_size=(window_size_left, window_size_right),# -1 means infinite context window
+        softcap=softcap,
+        alibi_slopes=alibi_slopes,
+        deterministic=deterministic,
+        return_attn_probs=return_attn_probs,
+        block_table=block_table,
+    )
+    golden_out = torch.empty((batch_size * q_seqlen, num_heads, head_size), dtype=data_type)
+    golden_lseL = torch.empty((num_heads, batch_size * q_seqlen), dtype=torch.float32)
+    atten_mask = None
+
+    def create_binary_matrix(qSeqlen, kvSeqlen, preToken, nextToken):
+        preToken = kvSeqlen - qSeqlen - preToken
+        nextToken = kvSeqlen - qSeqlen + nextToken
+        matrix = [[0 for _ in range(kvSeqlen)] for _ in range(qSeqlen)]
+        for i in range(qSeqlen):
+            for j in range(kvSeqlen):
+                is_below_pretoken_line = (-i + j) < preToken
+                is_above_nexttoken_line = (-i + j) > nextToken
+                if is_below_pretoken_line or is_above_nexttoken_line:
+                    matrix[i][j] = 1
+        return torch.tensor(matrix, dtype=torch.bool)
+
+    if is_causal_golden:
+        atten_mask = (torch.triu(torch.ones(q_seqlen, kv_seqlen), diagonal=kv_seqlen - q_seqlen + 1)).to(torch.bool)
+    elif is_local_golden:
+        atten_mask = create_binary_matrix(q_seqlen, kv_seqlen, window_size_left_golden, window_size_right_golden)
+
+    for i in range(1, batch_size + 1):
+        key_per_batch = key.detach().cpu()[(i - 1) * kv_seqlen : i * kv_seqlen]
+        value_per_batch = value.detach().cpu()[(i - 1) * kv_seqlen : i * kv_seqlen]
+        query_cpu = query.detach().cpu()[(i - 1) * q_seqlen : i * q_seqlen]
+        if is_causal_golden or is_local_golden:
+            output, golden_lse = ref_flash_attention(query_cpu, key_per_batch, value_per_batch, scale, atten_mask, data_type, softcap)
+        else:
+            output, golden_lse = ref_flash_attention(query_cpu, key_per_batch, value_per_batch, scale, None, data_type, softcap)
+        out = output.reshape(q_seqlen , num_heads, head_size)
+        if is_local_golden:
+            preTokens = window_size_left_golden
+            nextTokens = window_size_right_golden
+            preTokensChange = preTokens - kv_seqlen + q_seqlen
+            nextTokensChange = nextTokens + kv_seqlen - q_seqlen
+            nextTokensError = -nextTokensChange if nextTokensChange < 0 else 0
+            preTokensError = (q_seqlen - kv_seqlen - preTokensChange) if q_seqlen > kv_seqlen + preTokensChange else 0
+            actualSeq = q_seqlen
+            actualSeq -= nextTokensError
+            actualSeq -= preTokensError
+            if actualSeq != q_seqlen:
+                if nextTokensError != 0:
+                    actualSeq = q_seqlen - actualSeq
+                    out[ :actualSeq, :, :] = 0
+                    golden_lse[:, :actualSeq] = torch.inf
+                elif preTokensError != 0:
+                    out[actualSeq:, :, :] = 0
+                    golden_lse[:, actualSeq:] = torch.inf
+        golden_out[(i - 1) * q_seqlen : i * q_seqlen] = out
+        golden_lseL[:, (i - 1) * q_seqlen : i * q_seqlen] = golden_lse.reshape(num_heads, q_seqlen)
+    rtol = 1e-2
+    atol = 1e-2
+    torch.testing.assert_close(output_npu.cpu(), golden_out.cpu(), rtol=rtol, atol=atol)
+    torch.testing.assert_close(softmax_lse.cpu(), golden_lseL.cpu(), rtol=rtol, atol=atol)
+
+
+# ============ ALiBi Tests ============
+
+def generate_alibi_slopes(num_heads, batch_size=None, alibi_bias_max=8):
+    """
+    Generate ALiBi slopes following the official ALiBi implementation.
+
+    Args:
+        num_heads: number of attention heads
+        batch_size: if None, returns (nheads,) shared across batch;
+                   if int, returns (batch_size, nheads) per-batch slopes
+        alibi_bias_max: maximum ALiBi bias (default 8 from ALiBi paper)
+
+    Returns:
+        alibi_slopes: tensor of shape (nheads,) or (batch_size, nheads)
+    """
+    # ALiBi slope formula: slopes = -1 / (nheads / alibi_bias_max) ** (i + 1)
+    # where i in [0, nheads-1] for head index
+    x = (num_heads / alibi_bias_max) ** torch.arange(1, num_heads + 1, dtype=torch.float32)
+    slopes = 1.0 / x
+
+    if batch_size is not None:
+        # Broadcast to (batch_size, nheads) - all batches share the same slopes
+        slopes = slopes.unsqueeze(0).expand(batch_size, num_heads)
+
+    return slopes
+
+
+def ref_flash_attention_alibi(
+    query,
+    key,
+    value,
+    scale,
+    alibi_slopes,
+    is_causal,
+    data_type,
+    kv_seq_start=0,
+):
+    """
+    Reference flash attention implementation with ALiBi bias.
+
+    Args:
+        query: (q_seqlen, num_heads, head_size)
+        key: (kv_seqlen, num_heads_kv, head_size)
+        value: (kv_seqlen, num_heads_kv, head_size)
+        scale: scaling factor for attention scores
+        alibi_slopes: (num_heads,) or (1, num_heads) - ALiBi slopes per head
+        is_causal: whether to apply causal mask
+        data_type: output data type
+        kv_seq_start: starting position of key sequence (for causal ALiBi)
+
+    Returns:
+        output: (q_seqlen, num_heads, head_size)
+        lse: (num_heads, q_seqlen) log-sum-exp values
+    """
+    inner_prec = 0
+    interm_dtype = torch.float16 if inner_prec == 1 else torch.float32
+
+    query = query.to(torch.float32)
+    key = key.to(torch.float32)
+    value = value.to(torch.float32)
+
+    q_seqlen, num_heads, head_size = query.shape
+    kv_seqlen, num_heads_kv, _ = key.shape
+
+    # Handle GQA (grouped query attention) - replicate key/value across heads
+    group_num = num_heads // num_heads_kv
+    if group_num > 1:
+        key = key.repeat_interleave(group_num, dim=1)  # (kv_seqlen, num_heads, head_size)
+        value = value.repeat_interleave(group_num, dim=1)
+
+    # Compute QK^T
+    qk_result = torch.matmul(query, key.transpose(-2, -1))  # (num_heads, q_seqlen, kv_seqlen)
+    qk_result = qk_result.permute(1, 0, 2)  # (q_seqlen, num_heads, kv_seqlen)
+    qk_result = qk_result * scale
+
+    # Add ALiBi bias
+    if alibi_slopes is not None:
+        alibi_slopes = alibi_slopes.to(torch.float32)
+        if alibi_slopes.dim() == 1:
+            alibi_slopes = alibi_slopes.unsqueeze(0)  # (1, num_heads)
+
+        num_heads_slope = alibi_slopes.shape[1]
+        assert num_heads_slope == num_heads, f"alibi_slopes has {num_heads_slope} heads but query has {num_heads}"
+
+        # Reshape for broadcasting: (q_seqlen, kv_seqlen, 1, num_heads)
+        # Compute ALiBi bias per head and broadcast
+        alibi_bias = torch.zeros((q_seqlen, kv_seqlen, num_heads), dtype=torch.float32)
+
+        for h in range(num_heads):
+            slope = alibi_slopes[0, h].item()
+            for i in range(q_seqlen):
+                for j in range(kv_seqlen):
+                    # Absolute positions
+                    abs_q_pos = kv_seq_start + i
+                    abs_k_pos = kv_seq_start + j
+
+                    if is_causal:
+                        # Causal ALiBi: bias = slope * abs_k_pos (column-only, drops per-row constant)
+                        # But we need to ensure causality: only valid when i >= j (or abs_q_pos >= abs_k_pos)
+                        if abs_q_pos >= abs_k_pos:
+                            alibi_bias[i, j, h] = slope * abs_k_pos
+                        else:
+                            alibi_bias[i, j, h] = -1e10  # Mask out invalid positions
+                    else:
+                        # Non-causal ALiBi: bias = -slope * |i - j|
+                        # Absolute position difference: |(kv_seq_start + i) - (kv_seq_start + j)| = |i - j|
+                        alibi_bias[i, j, h] = -slope * abs(abs_q_pos - abs_k_pos)
+
+        # Add bias to qk_result
+        qk_result = qk_result + alibi_bias  # (q_seqlen, num_heads, kv_seqlen)
+
+    # Apply causal mask if needed (for causal ALiBi, we already masked in bias calculation)
+    if is_causal and alibi_slopes is None:
+        # Standard causal mask
+        causal_mask = torch.triu(torch.ones(q_seqlen, kv_seqlen), diagonal=kv_seqlen - q_seqlen + 1).bool()
+        qk_result = qk_result.masked_fill(causal_mask.unsqueeze(1), -1e10)
+
+    # Softmax
+    qk_result = qk_result.to(interm_dtype)
+    lm = torch.max(qk_result, dim=-1, keepdims=True)[0]
+    sim_sub = qk_result - lm
+    sim_sub = torch.exp(sim_sub.to(interm_dtype))
+    row_sum = torch.sum(sim_sub, dim=-1, keepdims=True)
+    p_result = sim_sub / row_sum
+    p_result = p_result.to(data_type)
+
+    # Compute output: P @ V
+    p_result = p_result.permute(1, 0, 2)  # (num_heads, q_seqlen, kv_seqlen)
+    output = torch.matmul(p_result, value.transpose(-2, -1))  # (num_heads, q_seqlen, head_size)
+    output = output.permute(1, 0, 2)  # (q_seqlen, num_heads, head_size)
+
+    # Compute LSE
+    lse = torch.squeeze(torch.log(row_sum) + lm, dim=-1).permute(1, 0)  # (num_heads, q_seqlen)
+
+    return output.to(data_type), lse
+
+
+# ALiBi test cases for flash_attn_with_kvcache (decode scenario)
+alibi_test_cases_kvcache = [
+    # (data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal, slopes_shape)
+    # Basic causal ALiBi tests
+    (torch.bfloat16, 1, 4, 4, 1, 1024, 128, 1, 128, True, None),      # decode, causal, shared slopes
+    (torch.bfloat16, 2, 8, 8, 1, 2048, 128, 1, 128, True, None),     # batch=2, causal, shared slopes
+    (torch.float16, 1, 16, 16, 1, 512, 64, 1, 128, True, None),       # smaller heads, causal
+
+    # Non-causal ALiBi tests
+    (torch.bfloat16, 1, 4, 4, 1, 1024, 128, 1, 128, False, None),     # decode, non-causal
+    (torch.bfloat16, 2, 8, 8, 1, 2048, 128, 1, 128, False, None),    # batch=2, non-causal
+
+    # GQA with ALiBi
+    (torch.bfloat16, 1, 32, 8, 1, 1024, 128, 1, 128, True, None),     # g=4, causal ALiBi
+    (torch.bfloat16, 2, 64, 16, 1, 2048, 128, 1, 128, False, None),   # g=4, non-causal
+
+    # Prefill (q_seqlen > 1) with ALiBi
+    (torch.bfloat16, 1, 4, 4, 16, 1024, 128, 0, 128, True, None),      # prefill, causal
+    (torch.bfloat16, 1, 8, 8, 32, 2048, 128, 0, 128, False, None),     # prefill, non-causal
+    (torch.float16, 2, 4, 4, 64, 512, 64, 0, 128, True, None),         # batch prefill, causal
+
+    # Multi-sequence tests
+    (torch.bfloat16, 4, 16, 16, 1, 4096, 128, 1, 128, True, None),    # multiple sequences, causal
+    (torch.bfloat16, 8, 32, 32, 1, 8192, 128, 1, 128, False, None),   # large batch, non-causal
+]
+
+@pytest.mark.parametrize("data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal, slopes_shape",
+                         alibi_test_cases_kvcache)
+def test_fa_kvcache_alibi(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal, slopes_shape):
+    """Test flash_attn_with_kvcache with ALiBi bias."""
+    q_min_range = -5.0
+    q_max_range = 5.0
+    kv_min_range = -5.0
+    kv_max_range = 5.0
+    num_blocks = 64
+
+    # Generate input data
+    query = (q_min_range + (q_max_range - q_min_range) * torch.rand(batch_size, q_seqlen, num_heads, head_size)).to(data_type).npu()
+
+    key_cache = (kv_min_range + (kv_max_range - kv_min_range) * torch.rand(num_blocks, block_size, kv_heads, head_size)).to(data_type).npu()
+    value_cache = (kv_min_range + (kv_max_range - kv_min_range) * torch.rand(num_blocks, block_size, kv_heads, head_size)).to(data_type).npu()
+
+    # Generate block tables
+    max_num_blocks_per_seq = (kv_seqlen + block_size - 1) // block_size
+    block_tables = []
+    for i in range(batch_size):
+        block_table = [max_num_blocks_per_seq * i + j for j in range(max_num_blocks_per_seq)]
+        block_tables.append(block_table)
+    block_tables = torch.tensor(block_tables, dtype=torch.int32).npu()
+
+    kv_seqlen_list = [kv_seqlen] * batch_size
+    kv_seqlen_list = torch.tensor(kv_seqlen_list, dtype=torch.int32).npu()
+
+    scale = 1.0 / (head_size ** 0.5)
+
+    # Generate ALiBi slopes
+    alibi_slopes = generate_alibi_slopes(num_heads, batch_size=None if slopes_shape is None else batch_size).to(data_type).npu()
+
+    # Call Flash Attention with ALiBi
+    out_npu, softmax_lse = flash_attn_with_kvcache(
+        query,
+        key_cache,
+        value_cache,
+        None,
+        None,
+        rotary_cos=None,
+        rotary_sin=None,
+        cache_seqlens=kv_seqlen_list,
+        cache_batch_idx=None,
+        cache_leftpad=None,
+        block_table=block_tables,
+        causal=is_causal,
+        window_size=[-1, -1],
+        rotary_interleaved=False,
+        alibi_slopes=alibi_slopes,
+        num_splits=0,
+        return_softmax_lse=True
+    )
+
+    # Compute reference output with ALiBi
+    golden_out = torch.empty((batch_size, q_seqlen, num_heads, head_size), dtype=data_type)
+    golden_lseL = torch.empty((batch_size, num_heads, q_seqlen), dtype=torch.float32)
+
+    key_cache_cpu = key_cache.detach().cpu()
+    value_cache_cpu = value_cache.detach().cpu()
+    block_tables_cpu = block_tables.cpu()
+
+    for i in range(batch_size):
+        # Reconstruct KV cache for this batch
+        keys = []
+        values = []
+        block_table = block_tables_cpu[i]
+
+        for j in range(kv_seqlen):
+            block_number = int(block_table[j // block_size])
+            block_offset = j % block_size
+            k = key_cache_cpu[block_number, block_offset, :, :]
+            k = k.reshape(kv_heads, head_size)
+            keys.append(k)
+            v = value_cache_cpu[block_number, block_offset, :, :]
+            v = v.reshape(kv_heads, head_size)
+            values.append(v)
+
+        key_cache_per_batch = torch.stack(keys, dim=0)  # (kv_seqlen, kv_heads, head_size)
+        value_cache_per_batch = torch.stack(values, dim=0)
+        query_cpu = query.detach().cpu()[i]  # (q_seqlen, num_heads, head_size)
+
+        # Call reference implementation with ALiBi
+        output, golden_lse = ref_flash_attention_alibi(
+            query_cpu, key_cache_per_batch, value_cache_per_batch,
+            scale, alibi_slopes.cpu(), is_causal, data_type, kv_seq_start=0
+        )
+
+        golden_out[i:i+1] = output.unsqueeze(0)
+        golden_lseL[i:i+1] = golden_lse.unsqueeze(0)
+
+    # Compare results (ALiBi can have larger numerical differences due to bias computation)
+    rtol = 2e-2  # Slightly relaxed tolerance for ALiBi
+    atol = 2e-2
+    torch.testing.assert_close(out_npu.cpu(), golden_out.cpu(), rtol=rtol, atol=atol)
+    torch.testing.assert_close(softmax_lse.cpu(), golden_lseL.cpu(), rtol=rtol, atol=atol)
+
+
+# ALiBi test cases for flash_attn_func (prefill scenario)
+alibi_test_cases_prefill = [
+    # (data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal)
+    (torch.bfloat16, 1, 4, 4, 128, 128, 128, True),
+    (torch.bfloat16, 2, 8, 8, 256, 256, 128, True),
+    (torch.float16, 1, 16, 16, 512, 512, 64, False),
+    (torch.bfloat16, 1, 32, 8, 1024, 1024, 128, True),    # GQA g=4
+    (torch.bfloat16, 2, 64, 16, 2048, 2048, 128, False),   # GQA g=4
+]
+
+@pytest.mark.parametrize("data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal",
+                         alibi_test_cases_prefill)
+def test_fa_prefill_alibi(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal):
+    """Test flash_attn_func (prefill) with ALiBi bias."""
+    q_min_range = -5.0
+    q_max_range = 5.0
+    kv_min_range = -5.0
+    kv_max_range = 5.0
+
+    # Generate input data
+    query = (q_min_range + (q_max_range - q_min_range) * torch.rand(batch_size, q_seqlen, num_heads, head_size)).to(data_type).npu()
+    key = (kv_min_range + (kv_max_range - kv_min_range) * torch.rand(batch_size, kv_seqlen, kv_heads, head_size)).to(data_type).npu()
+    value = (kv_min_range + (kv_max_range - kv_min_range) * torch.rand(batch_size, kv_seqlen, kv_heads, head_size)).to(data_type).npu()
+
+    scale = 1.0 / (head_size ** 0.5)
+
+    # Generate ALiBi slopes
+    alibi_slopes = generate_alibi_slopes(num_heads).to(data_type).npu()
+
+    # Call Flash Attention with ALiBi
+    out_npu = flash_attn_func(
+        query,
+        key,
+        value,
+        scale=scale,
+        causal=is_causal,
+        window_size=[-1, -1],
+        alibi_slopes=alibi_slopes,
+    )
+
+    # Compute reference output with ALiBi
+    golden_out = torch.empty((batch_size, q_seqlen, num_heads, head_size), dtype=data_type)
+
+    for i in range(batch_size):
+        query_cpu = query.detach().cpu()[i]
+        key_cpu = key.detach().cpu()[i]
+        value_cpu = value.detach().cpu()[i]
+
+        output, _ = ref_flash_attention_alibi(
+            query_cpu, key_cpu, value_cpu,
+            scale, alibi_slopes.cpu(), is_causal, data_type, kv_seq_start=0
+        )
+
+        golden_out[i:i+1] = output.unsqueeze(0)
+
+    # Compare results
+    rtol = 2e-2
+    atol = 2e-2
+    torch.testing.assert_close(out_npu.cpu(), golden_out.cpu(), rtol=rtol, atol=atol)
+
+
+if __name__ == "__main__":
+    # Run a quick test
+    print("Running ALiBi tests...")
+    pytest.main([__file__, "-k", "alibi", "-v", "-s"])
